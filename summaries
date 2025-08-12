@@ -1,1 +1,84 @@
+require('dotenv').config();
+const axios = require('axios');
+const cheerio = require('cheerio');
+const { Octokit } = require('@octokit/rest');
 
+// Nastavení přístupových údajů
+const perplexityApiKey = process.env.PERPLEXITY_API_KEY;
+const githubToken = process.env.GITHUB_TOKEN;
+const owner = "OnLi1971";
+const repo = "mounjaro-summaries";
+const branch = "main";
+const summariesDir = "summaries";
+
+// Zadej URL článku k shrnutí:
+const articleUrl = "https://www.example.com/clanek"; // Změň na reálný článek
+
+// 1. Stáhne text článku
+async function getArticleText(url) {
+  const res = await axios.get(url);
+  const $ = cheerio.load(res.data);
+  let text = '';
+  $('p').each((_, el) => {
+    text += $(el).text() + '\n';
+  });
+  return text.slice(0, 6000); // Omez na 6000 znaků
+}
+
+// 2. Pošle text na Perplexity API pro shrnutí v češtině
+async function getSummaryPerplexity(text) {
+  const prompt = `Shrň následující článek do 6–8 bodů v češtině:\n\n${text}`;
+  const response = await axios.post(
+    'https://api.perplexity.ai/v1/chat/completions',
+    {
+      model: 'pplx-7b-chat',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 600,
+      temperature: 0.4
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${perplexityApiKey}`,
+        'Content-Type': 'application/json'
+      }
+    }
+  );
+  return response.data.choices[0].message.content;
+}
+
+// 3. Nahraje summary jako Markdown do GitHub repa
+async function saveToGitHub(summary, url) {
+  const octokit = new Octokit({ auth: githubToken });
+  const today = new Date().toISOString().replace(/T.*/, "");
+  const randomStr = Math.random().toString(36).substring(2, 8);
+  const fileName = `${summariesDir}/${today}-${randomStr}.md`;
+  const content = Buffer.from(`# Shrnutí článku\n\nOriginál: [${url}](${url})\n\n${summary}`, "utf8").toString("base64");
+
+  await octokit.repos.createOrUpdateFileContents({
+    owner,
+    repo,
+    path: fileName,
+    message: `Automaticky přidáno shrnutí článku: ${url}`,
+    content,
+    branch,
+  });
+
+  return `https://github.com/${owner}/${repo}/blob/${branch}/${fileName}`;
+}
+
+// 4. Hlavní workflow
+async function run() {
+  try {
+    console.log(`Stahuji článek: ${articleUrl}`);
+    const text = await getArticleText(articleUrl);
+    console.log("Posílám na Perplexity API...");
+    const summary = await getSummaryPerplexity(text);
+    console.log("Ukládám na GitHub...");
+    const url = await saveToGitHub(summary, articleUrl);
+    console.log("Hotovo! Shrnutí na:", url);
+  } catch (e) {
+    console.error("Chyba:", e.message);
+  }
+}
+
+run();
