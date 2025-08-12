@@ -1,0 +1,25 @@
+{
+  "name": "mounjaro-summaries",
+  "version": "1.0.0",
+  "description": "Automatický sběrač a shrnovač článků z Google Sheets pomocí Perplexity API, výstup do GitHubu.",
+  "main": "perplexity-sheet-to-github.js",
+  "scripts": {
+    "start": "node perplexity-sheet-to-github.js"
+  },
+  "keywords": [
+    "summarization",
+    "perplexity",
+    "google-sheets",
+    "github",
+    "automation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "@octokit/rest": "^20.0.0",
+    "dotenv": "^16.0.0",
+    "googleapis": "^133.0.0"
+  }
+}
