@@ -18,7 +18,11 @@ jobs:
         run: echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}" > google-service-account.json
 
       - name: Check service account file size
-        run: ls -l google-service-account.json && head google-service-account.json
+        run: |
+          ls -l google-service-account.json
+          echo "==== FILE BEGIN ===="
+          head -n 20 google-service-account.json
+          echo "==== FILE END ===="
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
