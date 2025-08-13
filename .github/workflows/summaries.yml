@@ -1,17 +1,21 @@
-name: Auto Summarize News
+name: Create Summaries
 
 on:
-  schedule:
-    - cron: '0 7 * * *' # každý den v 7:00 UTC
-  workflow_dispatch:    # umožní ruční spuštění z GitHub UI
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
-  summarize:
+  build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Create google-service-account.json from secret
+        run: echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}" > google-service-account.json
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -19,13 +23,10 @@ jobs:
           node-version: '20.x'
 
       - name: Install dependencies
-        run: |
-          npm install
+        run: npm install
 
       - name: Run summarizer script
         env:
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/mounjaro-console-c32fb2c5fa97.json
-        run: |
-          node perplexity-sheet-to-github.js
+        run: node perplexity-sheet-to-github.js
