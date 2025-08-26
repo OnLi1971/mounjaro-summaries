@@ -28,11 +28,11 @@ const auth = new google.auth.GoogleAuth({
   scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
 });
 
-// ---------- Sheets helpers ----------
 function a1(title, range) {
   const safe = String(title || '').replace(/'/g, "''");
   return `'${safe}'!${range}`;
 }
+
 async function resolveSheetTitle(sheetsApi, spreadsheetId, preferredTitle) {
   const meta = await sheetsApi.spreadsheets.get({
     spreadsheetId,
@@ -44,6 +44,7 @@ async function resolveSheetTitle(sheetsApi, spreadsheetId, preferredTitle) {
   const common = titles.find(t => t === 'List1' || t === 'List 1' || t === 'Sheet1');
   return common || titles[0];
 }
+
 async function getUrlsFromSheet() {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
@@ -58,9 +59,8 @@ async function getUrlsFromSheet() {
   const rows = res.data.values || [];
   return rows.map(r => (r?.[0] || '').toString().trim()).filter(Boolean);
 }
-// ------------------------------------
 
-// ---------- Fetch & extract ----------
+// ----------------- Fetch & extract -----------------
 const BROWSER_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
@@ -168,8 +168,7 @@ function splitSentences(str) {
 }
 
 function fallbackFromText(title, text, url) {
-  const sentences = splitSentences(text);
-  // vyber 6–8 „delších“ vět
+  const sentences = splitSentences(text || '');
   const ranked = [...sentences].sort((a, b) => b.length - a.length).slice(0, 8);
   const teaser = sentences[0]?.slice(0, 200) || '';
   const markdown =
@@ -179,9 +178,8 @@ function fallbackFromText(title, text, url) {
     markdown,
   };
 }
-// ------------------------------------
 
-// ---------- Perplexity ----------
+// ----------------- Perplexity -----------------
 async function getSummaryPerplexity(text) {
   const prompt = `
 Vrátíš POUZE validní JSON bez jakéhokoli komentáře/markdownu ve tvaru:
@@ -196,9 +194,9 @@ ${text}
 `.trim();
 
   const response = await axios.post(
-    'https://api.perplexity.ai/v1/chat/completions',
+    'https://api.perplexity.ai/chat/completions', // ← opravený endpoint
     {
-      model: 'pplx-7b-chat',
+      model: 'sonar', // ← aktuální model (můžeš přepnout na 'sonar-pro')
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 700,
       temperature: 0.4,
@@ -213,7 +211,7 @@ ${text}
     }
   );
 
-  const raw = response.data.choices?.[0]?.message?.content ?? '';
+  const raw = response.data?.choices?.[0]?.message?.content ?? '';
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -228,9 +226,8 @@ ${text}
 
   return { title, markdown };
 }
-// -----------------------------------
 
-// ---------- GitHub save ----------
+// ----------------- GitHub save -----------------
 const octokit = new Octokit({ auth: githubToken });
 
 async function saveSummaryMarkdown({ title, markdown, url }) {
@@ -251,9 +248,8 @@ async function saveSummaryMarkdown({ title, markdown, url }) {
 
   return { fileName, webUrl: `https://github.com/${owner}/${repo}/blob/${branch}/${fileName}` };
 }
-// ----------------------------------
 
-// ---------- Static site (docs/) ----------
+// --------------- Static site (docs/) ---------------
 const DOCS_DIR = path.join(process.cwd(), 'docs');
 const POSTS_JSON = path.join(DOCS_DIR, 'posts.json');
 const INDEX_HTML = path.join(DOCS_DIR, 'index.html');
@@ -321,12 +317,12 @@ async function updateWebsite({ title, sourceUrl, summaryUrl, date }) {
   writePosts(posts);
   renderIndex(posts);
 }
-// -----------------------------------------
 
 function domainFromUrl(u) {
   try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return u; }
 }
 
+// ----------------- Main run -----------------
 async function run() {
   // skeleton, ať Pages žije i bez nových článků
   ensureDocs();
@@ -372,7 +368,7 @@ async function run() {
       await updateWebsite({
         title,
         sourceUrl: targetUrl,
-        summaryUrl: webUrl,  // 🔗 vždy na existující .md
+        summaryUrl: webUrl,  // vždy na existující .md
         date: todayISO,
       });
 
@@ -387,7 +383,7 @@ async function run() {
       await updateWebsite({
         title,
         sourceUrl: url,
-        summaryUrl: webUrl,  // 🔗 na .md fallback
+        summaryUrl: webUrl,
         date: todayISO,
       });
     }
