@@ -5,6 +5,9 @@ const { google } = require('googleapis');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { Octokit } = require('@octokit/rest');
+const { JSDOM } = require('jsdom');
+const { Readability } = require('@mozilla/readability');
+const normalizeUrl = require('normalize-url');
 
 const perplexityApiKey = process.env.PERPLEXITY_API_KEY;
 const githubToken = process.env.GITHUB_TOKEN;
@@ -14,18 +17,18 @@ const repo = 'mounjaro-summaries';
 const branch = 'main';
 const summariesDir = 'summaries';
 
-// Google Sheets (SHEET_NAME volitelně; když prázdné, autodetekce)
+// Google Sheets
 const SPREADSHEET_ID = process.env.SHEET_ID || '1KgrYXHpVfTAGQZT6f15aARGCQ-qgNQZM4HWQCiqt14s';
 const SHEET_NAME = process.env.SHEET_NAME || '';
-const RANGE = 'D2:D'; // URL ve sloupci D od řádku 2
+const RANGE = 'D2:D';
 
-// Service account JSON je v rootu jako google-service-account.json (viz workflow)
+// Auth (Sheets)
 const auth = new google.auth.GoogleAuth({
   keyFile: 'google-service-account.json',
   scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
 });
 
-// ---------- Google Sheets helpers ----------
+// ---------- Sheets helpers ----------
 function a1(title, range) {
   const safe = String(title || '').replace(/'/g, "''");
   return `'${safe}'!${range}`;
@@ -38,7 +41,7 @@ async function resolveSheetTitle(sheetsApi, spreadsheetId, preferredTitle) {
   const titles = meta.data.sheets?.map(s => s.properties.title) || [];
   if (!titles.length) throw new Error('Spreadsheet has no sheets.');
   if (preferredTitle && titles.includes(preferredTitle)) return preferredTitle;
-  const common = titles.find(t => t === 'List1' || t === 'Sheet1');
+  const common = titles.find(t => t === 'List1' || t === 'List 1' || t === 'Sheet1');
   return common || titles[0];
 }
 async function getUrlsFromSheet() {
@@ -55,22 +58,122 @@ async function getUrlsFromSheet() {
   const rows = res.data.values || [];
   return rows.map(r => (r?.[0] || '').toString().trim()).filter(Boolean);
 }
-// ------------------------------------------
+// ------------------------------------
 
-// ---------- Scrape + LLM ----------
-async function getArticleText(url) {
-  const res = await axios.get(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SummarizerBot/1.0)' },
-    timeout: 20000,
-  });
-  const $ = cheerio.load(res.data);
-  let text = '';
-  $('p').each((_, el) => (text += $(el).text() + '\n'));
-  return text.slice(0, 6000);
+// ---------- Fetch & extract ----------
+const BROWSER_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  'Accept':
+    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9,cs;q=0.8',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'Upgrade-Insecure-Requests': '1',
+  'Referer': 'https://news.google.com/',
+};
+
+function buildUrlVariants(url) {
+  const variants = new Set();
+  try {
+    // základní normalizace (bez mazání parametrů)
+    variants.add(
+      normalizeUrl(url, {
+        removeTrailingSlash: false,
+        stripHash: true,
+        sortQueryParameters: false,
+      })
+    );
+  } catch {
+    variants.add(url);
+  }
+
+  const u = new URL([...variants][0]);
+
+  // 1) přidej trailing slash, pokud chybí a poslední segment nemá tečku
+  const segs = u.pathname.split('/');
+  const last = segs.filter(Boolean).pop() || '';
+  const noExt = last && !last.includes('.');
+  if (noExt && !u.pathname.endsWith('/')) {
+    const u2 = new URL(u.toString());
+    u2.pathname = u.pathname + '/';
+    variants.add(u2.toString());
+  }
+
+  // 2) varianta bez ?rss=yes a bez běžných tracking parametrů
+  const u3 = new URL(u.toString());
+  u3.searchParams.delete('rss');
+  for (const k of Array.from(u3.searchParams.keys())) {
+    if (k.startsWith('utm_') || k === 'fbclid' || k === 'gclid') u3.searchParams.delete(k);
+  }
+  variants.add(u3.toString());
+
+  return [...variants];
 }
 
+async function fetchHtml(url) {
+  const variants = buildUrlVariants(url);
+  let lastErr;
+  for (const v of variants) {
+    try {
+      const res = await axios.get(v, {
+        headers: BROWSER_HEADERS,
+        maxRedirects: 5,
+        timeout: 30000,
+        validateStatus: () => true, // zpracujeme i non-200
+      });
+      if (res.status >= 200 && res.status < 300 && res.data) {
+        return { html: res.data, finalUrl: v };
+      }
+      lastErr = new Error(`HTTP ${res.status}`);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('Fetch failed');
+}
+
+function extractArticle(html, baseUrl) {
+  try {
+    const dom = new JSDOM(html, { url: baseUrl });
+    const doc = dom.window.document;
+    const reader = new Readability(doc).parse();
+    if (reader && reader.textContent && reader.textContent.trim().length > 400) {
+      const title =
+        reader.title?.trim() ||
+        doc.querySelector('meta[property="og:title"]')?.content?.trim() ||
+        doc.title?.trim() ||
+        'Shrnutí článku';
+      const text = reader.textContent.replace(/\n{3,}/g, '\n\n').trim();
+      return { title, text };
+    }
+  } catch (_) {
+    // fall through
+  }
+
+  // Fallback: meta + <p>
+  const $ = cheerio.load(html);
+  const title =
+    $('meta[property="og:title"]').attr('content')?.trim() ||
+    $('title').text().trim() ||
+    'Shrnutí článku';
+
+  let text = $('meta[name="description"]').attr('content')?.trim() || '';
+  if (text.length < 400) {
+    let acc = '';
+    $('p').each((_, el) => {
+      const t = $(el).text().trim();
+      if (t) acc += t + '\n';
+      if (acc.length > 7000) return false; // limit
+    });
+    text = acc.trim();
+  }
+  return { title, text };
+}
+// ------------------------------------
+
+// ---------- Perplexity ----------
 async function getSummaryPerplexity(text) {
-  // Požádáme o STROHÝ JSON: title + bullets + teaser
   const prompt = `
 Vrátíš POUZE validní JSON bez jakéhokoli komentáře/markdownu ve tvaru:
 {"title": "...", "bullets": ["...", "..."], "teaser": "..."}
@@ -106,21 +209,15 @@ ${text}
   try {
     parsed = JSON.parse(raw);
   } catch {
-    // fallback: uděláme prostý titulek a body z textu, když JSON selže
-    parsed = {
-      title: 'Shrnutí článku',
-      bullets: raw.split('\n').filter(Boolean).slice(0, 8),
-      teaser: '',
-    };
+    parsed = { title: 'Shrnutí článku', bullets: raw.split('\n').filter(Boolean).slice(0, 8), teaser: '' };
   }
   const title = String(parsed.title || 'Shrnutí článku').trim();
   const bullets = Array.isArray(parsed.bullets) ? parsed.bullets : [];
   const teaser = String(parsed.teaser || '').trim();
   const markdown =
-    (teaser ? `${teaser}\n\n` : '') +
-    bullets.map(b => `- ${b}`.replace(/\s+/g, ' ')).join('\n');
+    (teaser ? `${teaser}\n\n` : '') + bullets.map(b => `- ${b}`.replace(/\s+/g, ' ')).join('\n');
 
-  return { title, bullets, teaser, markdown };
+  return { title, markdown };
 }
 // -----------------------------------
 
@@ -131,7 +228,6 @@ async function saveSummaryMarkdown({ title, markdown, url }) {
   const todayISO = new Date().toISOString().slice(0, 10);
   const randomStr = Math.random().toString(36).slice(2, 8);
   const fileName = `${summariesDir}/${todayISO}-${randomStr}.md`;
-
   const md = `# ${title}\n\nZdroj: [${url}](${url})\n\n${markdown}\n`;
   const content = Buffer.from(md, 'utf8').toString('base64');
 
@@ -148,7 +244,7 @@ async function saveSummaryMarkdown({ title, markdown, url }) {
 }
 // ----------------------------------
 
-// ---------- Simple static site (docs/) ----------
+// ---------- Static site (docs/) ----------
 const DOCS_DIR = path.join(process.cwd(), 'docs');
 const POSTS_JSON = path.join(DOCS_DIR, 'posts.json');
 const INDEX_HTML = path.join(DOCS_DIR, 'index.html');
@@ -159,20 +255,8 @@ function ensureDocs() {
   if (!fs.existsSync(STYLES_CSS)) {
     fs.writeFileSync(
       STYLES_CSS,
-      `
-:root{--fg:#111;--muted:#666;--bg:#fff;--card:#fafafa;--accent:#2563eb;}
-*{box-sizing:border-box}body{margin:0;font:16px/1.6 system-ui,Segoe UI,Roboto,Arial;color:var(--fg);background:var(--bg)}
-.container{max-width:900px;margin:40px auto;padding:0 16px}
-header{margin-bottom:24px}
-h1{font-size:28px;margin:0 0 8px}
-.list{display:grid;gap:14px}
-.card{background:var(--card);border:1px solid #eee;border-radius:14px;padding:16px}
-.card h2{margin:0 0 6px;font-size:18px}
-.card .meta{color:var(--muted);font-size:13px;margin-bottom:8px}
-.card a.btn{display:inline-block;margin-right:8px;font-size:14px;padding:6px 10px;border-radius:10px;border:1px solid #ddd;text-decoration:none;color:var(--fg)}
-.card a.btn.primary{border-color:var(--accent);color:var(--accent)}
-footer{margin:24px 0;color:var(--muted);font-size:13px}
-      `.trim()
+      'body{font:16px/1.6 system-ui,Segoe UI,Roboto,Arial;margin:0;padding:24px}\n.container{max-width:900px;margin:0 auto}\n.list{display:grid;gap:14px}\n.card{background:#fafafa;border:1px solid #eee;border-radius:14px;padding:16px}\n.card h2{margin:0 0 6px;font-size:18px}\n.card .meta{color:#666;font-size:13px;margin-bottom:8px}\n.card a.btn{display:inline-block;margin-right:8px;font-size:14px;padding:6px 10px;border-radius:10px;border:1px solid #ddd;text-decoration:none;color:#111}\n.card a.btn.primary{border-color:#2563eb;color:#2563eb}\n',
+      'utf8'
     );
   }
 }
@@ -188,15 +272,16 @@ function readPosts() {
 }
 
 function writePosts(posts) {
-  // keep latest 200
-  const trimmed = posts.slice(0, 200);
-  fs.writeFileSync(POSTS_JSON, JSON.stringify(trimmed, null, 2), 'utf8');
+  fs.writeFileSync(POSTS_JSON, JSON.stringify(posts.slice(0, 200), null, 2), 'utf8');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function renderIndex(posts) {
-  const cards = posts
-    .map(
-      p => `
+  const cards = posts.map(p => `
   <article class="card">
     <h2>${escapeHtml(p.title)}</h2>
     <div class="meta">${p.date} · <a href="${p.sourceUrl}" target="_blank" rel="noopener">Zdroj</a></div>
@@ -204,54 +289,41 @@ function renderIndex(posts) {
       <a class="btn primary" href="${p.sourceUrl}" target="_blank" rel="noopener">Přečíst zdroj</a>
       <a class="btn" href="${p.summaryUrl}" target="_blank" rel="noopener">Plné shrnutí (GitHub)</a>
     </div>
-  </article>`
-    )
-    .join('\n');
+  </article>`).join('\n');
 
   const html = `<!doctype html>
-<html lang="cs">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agregátor shrnutí</title>
 <link rel="stylesheet" href="./styles.css">
-<body>
-  <div class="container">
-    <header>
-      <h1>Agregátor shrnutí</h1>
-      <div class="meta">Denní výběr článků s rychlým shrnutím</div>
-    </header>
-    <section class="list">
-      ${cards || '<p>Ještě tu nic není.</p>'}
-    </section>
-    <footer>
-      Generováno automaticky • <a href="https://github.com/${owner}/${repo}">repo</a>
-    </footer>
+<div class="container">
+  <h1>Agregátor shrnutí</h1>
+  <div class="list">
+    ${cards || '<p>Ještě tu nic není.</p>'}
   </div>
-</body>
-</html>`;
+</div>`;
   fs.writeFileSync(INDEX_HTML, html, 'utf8');
-}
-
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 async function updateWebsite({ title, sourceUrl, summaryUrl, date }) {
   ensureDocs();
-  const posts = readPosts();
-
-  // dedupe podle sourceUrl (nejnovější na začátek)
-  const filtered = posts.filter(p => p.sourceUrl !== sourceUrl);
-  filtered.unshift({ title, sourceUrl, summaryUrl, date });
-
-  writePosts(filtered);
-  renderIndex(filtered);
+  const posts = readPosts().filter(p => p.sourceUrl !== sourceUrl);
+  posts.unshift({ title, sourceUrl, summaryUrl, date });
+  writePosts(posts);
+  renderIndex(posts);
 }
-// ---------------------------------------------
+// -----------------------------------------
+
+function domainFromUrl(u) {
+  try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return u; }
+}
 
 async function run() {
+  // vždy vytvoř prázdný skeleton, ať Pages žije
+  ensureDocs();
+  if (!fs.existsSync(POSTS_JSON)) fs.writeFileSync(POSTS_JSON, '[]', 'utf8');
+  renderIndex(readPosts());
+
   const urls = await getUrlsFromSheet();
   if (!urls.length) {
     console.log('Ve sloupci D nejsou žádné URL – končím.');
@@ -260,12 +332,21 @@ async function run() {
 
   for (const url of urls) {
     if (!/^https?:\/\//i.test(url)) continue;
+
     try {
       console.log(`Stahuji článek: ${url}`);
-      const text = await getArticleText(url);
+      const { html, finalUrl } = await fetchHtml(url);
 
-      if (!text || text.trim().length < 200) {
-        console.warn('Vytažený text je prázdný/krátký – přeskočeno.');
+      const { title: extractedTitle, text } = extractArticle(html, finalUrl);
+      if (!text || text.trim().length < 300) {
+        console.warn('Vytažený text je prázdný/krátký – přeskočeno na placeholder.');
+        const todayISO = new Date().toISOString().slice(0, 10);
+        await updateWebsite({
+          title: extractedTitle || `Odkaz: ${domainFromUrl(url)}`,
+          sourceUrl: finalUrl || url,
+          summaryUrl: url,
+          date: todayISO,
+        });
         continue;
       }
 
@@ -273,23 +354,28 @@ async function run() {
       const { title, markdown } = await getSummaryPerplexity(text);
 
       console.log('Ukládám Markdown do repa…');
-      const { fileName, webUrl } = await saveSummaryMarkdown({ title, markdown, url });
+      const { webUrl } = await saveSummaryMarkdown({ title, markdown, url: finalUrl || url });
 
       console.log('Aktualizuji statický web (docs/)…');
       const todayISO = new Date().toISOString().slice(0, 10);
       await updateWebsite({
         title,
-        sourceUrl: url,
+        sourceUrl: finalUrl || url,
         summaryUrl: webUrl,
         date: todayISO,
       });
 
-      // Commit index.html / posts.json / styles.css do repa přes API:
-      // (nejjednodušší je přidat je do samotného repa a commitnout přes Actions git,
-      // ale zůstanu u jednodušší varianty: necháme to na běžném git commit v jobu)
-      console.log('Hotovo pro:', url, '→', fileName);
+      console.log('Hotovo pro:', url);
     } catch (e) {
       console.error(`Chyba u ${url}:`, e?.message || e);
+      // i při chybě přidej placeholder kartu, ať stránka „žije“
+      const todayISO = new Date().toISOString().slice(0, 10);
+      await updateWebsite({
+        title: `Odkaz: ${domainFromUrl(url)}`,
+        sourceUrl: url,
+        summaryUrl: url,
+        date: todayISO,
+      });
     }
   }
 }
