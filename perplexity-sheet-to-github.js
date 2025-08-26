@@ -76,7 +76,6 @@ const BROWSER_HEADERS = {
 function buildUrlVariants(url) {
   const variants = new Set();
   try {
-    // základní normalizace (bez mazání parametrů)
     variants.add(
       normalizeUrl(url, {
         removeTrailingSlash: false,
@@ -87,10 +86,7 @@ function buildUrlVariants(url) {
   } catch {
     variants.add(url);
   }
-
   const u = new URL([...variants][0]);
-
-  // 1) přidej trailing slash, pokud chybí a poslední segment nemá tečku
   const segs = u.pathname.split('/');
   const last = segs.filter(Boolean).pop() || '';
   const noExt = last && !last.includes('.');
@@ -99,15 +95,12 @@ function buildUrlVariants(url) {
     u2.pathname = u.pathname + '/';
     variants.add(u2.toString());
   }
-
-  // 2) varianta bez ?rss=yes a bez běžných tracking parametrů
   const u3 = new URL(u.toString());
   u3.searchParams.delete('rss');
   for (const k of Array.from(u3.searchParams.keys())) {
     if (k.startsWith('utm_') || k === 'fbclid' || k === 'gclid') u3.searchParams.delete(k);
   }
   variants.add(u3.toString());
-
   return [...variants];
 }
 
@@ -120,7 +113,7 @@ async function fetchHtml(url) {
         headers: BROWSER_HEADERS,
         maxRedirects: 5,
         timeout: 30000,
-        validateStatus: () => true, // zpracujeme i non-200
+        validateStatus: () => true,
       });
       if (res.status >= 200 && res.status < 300 && res.data) {
         return { html: res.data, finalUrl: v };
@@ -147,28 +140,44 @@ function extractArticle(html, baseUrl) {
       const text = reader.textContent.replace(/\n{3,}/g, '\n\n').trim();
       return { title, text };
     }
-  } catch (_) {
-    // fall through
-  }
-
-  // Fallback: meta + <p>
+  } catch (_) {}
   const $ = cheerio.load(html);
   const title =
     $('meta[property="og:title"]').attr('content')?.trim() ||
     $('title').text().trim() ||
     'Shrnutí článku';
-
   let text = $('meta[name="description"]').attr('content')?.trim() || '';
   if (text.length < 400) {
     let acc = '';
     $('p').each((_, el) => {
       const t = $(el).text().trim();
       if (t) acc += t + '\n';
-      if (acc.length > 7000) return false; // limit
+      if (acc.length > 7000) return false;
     });
     text = acc.trim();
   }
   return { title, text };
+}
+
+function splitSentences(str) {
+  return String(str)
+    .replace(/\s+/g, ' ')
+    .split(/(?<=[.!?])\s+(?=[A-ZÁČĎÉĚÍĽĹŇÓÔŘŠŤÚŮÝŽ])/u)
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+}
+
+function fallbackFromText(title, text, url) {
+  const sentences = splitSentences(text);
+  // vyber 6–8 „delších“ vět
+  const ranked = [...sentences].sort((a, b) => b.length - a.length).slice(0, 8);
+  const teaser = sentences[0]?.slice(0, 200) || '';
+  const markdown =
+    (teaser ? `${teaser}\n\n` : '') + ranked.map(s => `- ${s}`).join('\n');
+  return {
+    title: title || `Shrnutí: ${domainFromUrl(url)}`,
+    markdown,
+  };
 }
 // ------------------------------------
 
@@ -319,7 +328,7 @@ function domainFromUrl(u) {
 }
 
 async function run() {
-  // vždy vytvoř prázdný skeleton, ať Pages žije
+  // skeleton, ať Pages žije i bez nových článků
   ensureDocs();
   if (!fs.existsSync(POSTS_JSON)) fs.writeFileSync(POSTS_JSON, '[]', 'utf8');
   renderIndex(readPosts());
@@ -338,42 +347,47 @@ async function run() {
       const { html, finalUrl } = await fetchHtml(url);
 
       const { title: extractedTitle, text } = extractArticle(html, finalUrl);
+      const targetUrl = finalUrl || url;
+
+      let title, markdown;
+
       if (!text || text.trim().length < 300) {
-        console.warn('Vytažený text je prázdný/krátký – přeskočeno na placeholder.');
-        const todayISO = new Date().toISOString().slice(0, 10);
-        await updateWebsite({
-          title: extractedTitle || `Odkaz: ${domainFromUrl(url)}`,
-          sourceUrl: finalUrl || url,
-          summaryUrl: url,
-          date: todayISO,
-        });
-        continue;
+        console.warn('Text prázdný/krátký – použiji fallback bez LLM.');
+        ({ title, markdown } = fallbackFromText(extractedTitle, text || '', targetUrl));
+      } else {
+        console.log('Posílám na Perplexity API…');
+        try {
+          ({ title, markdown } = await getSummaryPerplexity(text));
+        } catch (e) {
+          console.warn('Perplexity selhalo – použiji fallback bez LLM:', e?.message || e);
+          ({ title, markdown } = fallbackFromText(extractedTitle, text, targetUrl));
+        }
       }
 
-      console.log('Posílám na Perplexity API…');
-      const { title, markdown } = await getSummaryPerplexity(text);
-
       console.log('Ukládám Markdown do repa…');
-      const { webUrl } = await saveSummaryMarkdown({ title, markdown, url: finalUrl || url });
+      const { webUrl } = await saveSummaryMarkdown({ title, markdown, url: targetUrl });
 
       console.log('Aktualizuji statický web (docs/)…');
       const todayISO = new Date().toISOString().slice(0, 10);
       await updateWebsite({
         title,
-        sourceUrl: finalUrl || url,
-        summaryUrl: webUrl,
+        sourceUrl: targetUrl,
+        summaryUrl: webUrl,  // 🔗 vždy na existující .md
         date: todayISO,
       });
 
       console.log('Hotovo pro:', url);
     } catch (e) {
       console.error(`Chyba u ${url}:`, e?.message || e);
-      // i při chybě přidej placeholder kartu, ať stránka „žije“
+      // úplný fallback: vytvoř .md s informací o chybě, ať link nikdy nemíří na zdroj
+      const title = `Odkaz: ${domainFromUrl(url)}`;
+      const markdown = `Nepodařilo se stáhnout obsah článku pro automatické shrnutí.\n\nZkuste prosím původní zdroj: ${url}\n`;
+      const { webUrl } = await saveSummaryMarkdown({ title, markdown, url });
       const todayISO = new Date().toISOString().slice(0, 10);
       await updateWebsite({
-        title: `Odkaz: ${domainFromUrl(url)}`,
+        title,
         sourceUrl: url,
-        summaryUrl: url,
+        summaryUrl: webUrl,  // 🔗 na .md fallback
         date: todayISO,
       });
     }
