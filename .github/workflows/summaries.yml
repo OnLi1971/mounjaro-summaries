@@ -3,18 +3,26 @@ name: Create Summaries
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  # Denní plán (08:00 UTC ~ 10:00 v létě v Praze)
+  schedule:
+    - cron: '0 8 * * *'
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    concurrency:
+      group: summaries
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ✅ ZAPÍŠE SECRET DO SOUBORU DOSLOVNĚ (zachová uvozovky i řádky)
+      # Zapíše service-account JSON doslova (zachová uvozovky i řádky)
       - name: Write google-service-account.json from secret
         shell: bash
         run: |
@@ -23,22 +31,34 @@ jobs:
           JSON
           chmod 600 google-service-account.json
 
+      # Rychlá validace JSON (neleakuje obsah)
+      - name: Validate service account JSON
+        run: node -e "const fs=require('fs');JSON.parse(fs.readFileSync('google-service-account.json','utf8'));console.log('Service account OK');"
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20.x'
-
-      # ✅ Rychlá validace JSONu (nevypisuje tajný obsah)
-      - name: Validate service account JSON
-        run: node -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync('google-service-account.json','utf8')); if(j.type!=='service_account') throw new Error('Not a service_account JSON'); console.log('Service account OK');"
+          cache: 'npm'
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci || npm install
 
       - name: Run summarizer script
         env:
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Pokud tvůj skript čte GOOGLE_APPLICATION_CREDENTIALS, můžeš mu ho předat:
-          # GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/google-service-account.json
+          # Volitelně přepiš název listu; když vynecháš, skript si ho najde sám
+          SHEET_ID: 1KgrYXHpVfTAGQZT6f15aARGCQ-qgNQZM4HWQCiqt14s
+          SHEET_NAME: List1
         run: node perplexity-sheet-to-github.js
+
+      # Commitne a pushne změny statického webu v docs/ (index.html, posts.json, styles.css)
+      - name: Commit website updates (docs/)
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          git diff --cached --quiet || git commit -m "Update website (docs) [skip ci]"
+          git push
