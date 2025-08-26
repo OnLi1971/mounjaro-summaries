@@ -6,7 +6,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: "0 8 * * *"  # 08:00 UTC
+    - cron: "0 8 * * *"
 
 permissions:
   contents: write
@@ -42,7 +42,7 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install dependencies (robust)
+      - name: Install dependencies (multi-registry, retry)
         shell: bash
         run: |
           set -e
@@ -58,18 +58,25 @@ jobs:
             CMD="npm install --no-audit --no-fund"
           fi
 
-          for attempt in 1 2 3 4 5; do
-            echo "Attempt $attempt: $CMD"
-            if $CMD; then
-              echo "Dependencies installed."
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              echo "Install failed after $attempt attempts."
-              exit 1
-            fi
-            sleep $((attempt * 10))
+          success=""
+          for registry in https://registry.npmjs.org/ https://registry.yarnpkg.com/ https://registry.npmmirror.com/; do
+            echo "Trying registry: $registry"
+            npm config set registry "$registry"
+            for attempt in 1 2 3 4 5; do
+              echo "Attempt $attempt: $CMD (registry=$registry)"
+              if $CMD; then
+                echo "Dependencies installed (registry=$registry)."
+                success="yes"
+                break 2
+              fi
+              sleep $((attempt * 10))
+            done
           done
+
+          if [ -z "$success" ]; then
+            echo "Install failed across all registries."
+            exit 1
+          fi
 
       - name: Install runtime extras (jsdom, readability, normalize-url)
         shell: bash
@@ -80,16 +87,26 @@ jobs:
           npm config set fetch-retries 5
           npm config set fetch-retry-mintimeout 20000
           npm config set fetch-retry-maxtimeout 120000
-          for attempt in 1 2 3 4 5; do
-            echo "Attempt $attempt: npm i --no-save jsdom @mozilla/readability normalize-url"
-            if npm i --no-save jsdom @mozilla/readability normalize-url; then
-              echo "Extras installed."
-              exit 0
-            fi
-            sleep $((attempt * 10))
+
+          success=""
+          for registry in https://registry.npmjs.org/ https://registry.yarnpkg.com/ https://registry.npmmirror.com/; do
+            echo "Trying registry for extras: $registry"
+            npm config set registry "$registry"
+            for attempt in 1 2 3 4 5; do
+              echo "Attempt $attempt: npm i --no-save jsdom @mozilla/readability normalize-url (registry=$registry)"
+              if npm i --no-save jsdom @mozilla/readability normalize-url; then
+                echo "Extras installed (registry=$registry)."
+                success="yes"
+                break 2
+              fi
+              sleep $((attempt * 10))
+            done
           done
-          echo "Extras install failed after 5 attempts."
-          exit 1
+
+          if [ -z "$success" ]; then
+            echo "Extras install failed across all registries."
+            exit 1
+          fi
 
       - name: Run summarizer script
         shell: bash
