@@ -71,6 +71,26 @@ jobs:
             sleep $((attempt * 10))
           done
 
+      - name: Install runtime extras (jsdom, readability, normalize-url)
+        shell: bash
+        run: |
+          set -e
+          npm config set fund false
+          npm config set audit false
+          npm config set fetch-retries 5
+          npm config set fetch-retry-mintimeout 20000
+          npm config set fetch-retry-maxtimeout 120000
+          for attempt in 1 2 3 4 5; do
+            echo "Attempt $attempt: npm i --no-save jsdom @mozilla/readability normalize-url"
+            if npm i --no-save jsdom @mozilla/readability normalize-url; then
+              echo "Extras installed."
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          echo "Extras install failed after 5 attempts."
+          exit 1
+
       - name: Run summarizer script
         shell: bash
         env:
