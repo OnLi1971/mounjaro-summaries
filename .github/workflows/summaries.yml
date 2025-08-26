@@ -50,37 +50,40 @@ jobs:
         env:
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Volitelně přepiš název listu; když vynecháš, skript si ho najde sám
           SHEET_ID: 1KgrYXHpVfTAGQZT6f15aARGCQ-qgNQZM4HWQCiqt14s
           SHEET_NAME: List1
         run: node perplexity-sheet-to-github.js
 
-      # ✅ Vytvoří základ webu a vypne Jekyll (žádné SCSS požadavky)
+      # ✅ Vytvoř základ webu a vypni Jekyll (.nojekyll). Používá printf (bez heredoců).
       - name: Ensure docs skeleton
         shell: bash
         run: |
           mkdir -p docs
-          # vypni Jekyll
+          # Vypni Jekyll (žádné SCSS požadavky)
           touch docs/.nojekyll
-          # základní index, pokud chybí
+
+          # Základní index, pokud chybí
           if [ ! -f docs/index.html ]; then
-            cat > docs/index.html <<'HTML'
-            <!doctype html>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width,initial-scale=1">
-            <title>Mounjaro Summaries</title>
-            <link rel="stylesheet" href="./styles.css">
-            <div class="container">
-              <h1>Mounjaro Summaries</h1>
-              <p>Obsah se sem doplní po běhu workflow.</p>
-            </div>
-            HTML
+            printf '%s\n' \
+'<!doctype html>' \
+'<meta charset="utf-8">' \
+'<meta name="viewport" content="width=device-width,initial-scale=1">' \
+'<title>Mounjaro Summaries</title>' \
+'<link rel="stylesheet" href="./styles.css">' \
+'<div class="container">' \
+'  <h1>Mounjaro Summaries</h1>' \
+'  <p>Obsah se sem doplní po běhu workflow.</p>' \
+'</div>' \
+> docs/index.html
           fi
-          # jednoduchý styl, pokud chybí
+
+          # Jednoduchý styl, pokud chybí
           if [ ! -f docs/styles.css ]; then
-            cat > docs/styles.css <<'CSS'
-            body{font:16px/1.6 system-ui,Segoe UI,Roboto,Arial;margin:0;padding:24px}
-            .container{max-width:900px;margin:0 auto}
-            CSS
+            printf '%s\n' \
+'body{font:16px/1.6 system-ui,Segoe UI,Roboto,Arial;margin:0;padding:24px}' \
+'.container{max-width:900px;margin:0 auto}' \
+> docs/styles.css
           fi
 
       # Commit & push změn statického webu v docs/ (index.html, posts.json, styles.css, .nojekyll)
@@ -96,6 +99,7 @@ jobs:
 
           git checkout "$BRANCH_NAME"
 
+          # Pokud skript nic nevytvořil, slušně skonči
           if [ ! -d docs ]; then
             echo "No docs/ directory generated — skipping commit."
             exit 0
@@ -103,11 +107,14 @@ jobs:
 
           git add docs
 
+          # Když není co commitnout, skonči bez chyby
           if git diff --cached --quiet; then
             echo "No changes in docs/ — nothing to commit."
             exit 0
           fi
 
+          # Rebase proti remote, ať push nepadá na non-fast-forward
           git pull --rebase origin "$BRANCH_NAME" || true
+
           git commit -m "Update website (docs) [skip ci]"
           git push origin HEAD:"$BRANCH_NAME"
