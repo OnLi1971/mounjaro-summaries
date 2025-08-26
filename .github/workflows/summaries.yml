@@ -3,10 +3,9 @@ name: Create Summaries
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
-  # Denní plán (08:00 UTC ~ 10:00 v létě v Praze)
+    branches: [main]
   schedule:
-    - cron: '0 8 * * *'
+    - cron: "0 8 * * *" # 08:00 UTC
 
 permissions:
   contents: write
@@ -18,6 +17,10 @@ jobs:
       group: summaries
       cancel-in-progress: false
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,9 +28,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      # Zapiš service-account JSON doslova (zachová uvozovky i řádky)
       - name: Write google-service-account.json from secret
-        shell: bash
         run: |
           cat > google-service-account.json <<'JSON'
           ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -40,8 +41,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
-          # cache: 'npm'  # necháno vypnuté, pokud v repu není package-lock.json
+          node-version: "20"
 
       - name: Install dependencies
         run: npm ci || npm install
@@ -50,20 +50,15 @@ jobs:
         env:
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Volitelně přepiš název listu; když vynecháš, skript si ho najde sám
           SHEET_ID: 1KgrYXHpVfTAGQZT6f15aARGCQ-qgNQZM4HWQCiqt14s
           SHEET_NAME: List1
         run: node perplexity-sheet-to-github.js
 
-      # ✅ Vytvoř základ webu a vypni Jekyll (.nojekyll). Používá printf (bez heredoců).
       - name: Ensure docs skeleton
-        shell: bash
         run: |
           mkdir -p docs
-          # Vypni Jekyll (žádné SCSS požadavky)
           touch docs/.nojekyll
 
-          # Základní index, pokud chybí
           if [ ! -f docs/index.html ]; then
             printf '%s\n' \
 '<!doctype html>' \
@@ -78,7 +73,6 @@ jobs:
 > docs/index.html
           fi
 
-          # Jednoduchý styl, pokud chybí
           if [ ! -f docs/styles.css ]; then
             printf '%s\n' \
 'body{font:16px/1.6 system-ui,Segoe UI,Roboto,Arial;margin:0;padding:24px}' \
@@ -86,20 +80,18 @@ jobs:
 > docs/styles.css
           fi
 
-      # Commit & push změn statického webu v docs/ (index.html, posts.json, styles.css, .nojekyll)
       - name: Commit website updates (docs/)
         if: always()
         env:
-          BRANCH_NAME: ${{ github.ref_name }}
+          BRANCH_NAME: "${{ github.ref_name }}"
         run: |
           set -e
-          git config --global user.name  "github-actions[bot]"
+          git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
           git checkout "$BRANCH_NAME"
 
-          # Pokud skript nic nevytvořil, slušně skonči
           if [ ! -d docs ]; then
             echo "No docs/ directory generated — skipping commit."
             exit 0
@@ -107,14 +99,11 @@ jobs:
 
           git add docs
 
-          # Když není co commitnout, skonči bez chyby
           if git diff --cached --quiet; then
             echo "No changes in docs/ — nothing to commit."
             exit 0
           fi
 
-          # Rebase proti remote, ať push nepadá na non-fast-forward
           git pull --rebase origin "$BRANCH_NAME" || true
-
           git commit -m "Update website (docs) [skip ci]"
           git push origin HEAD:"$BRANCH_NAME"
