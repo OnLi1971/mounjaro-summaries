@@ -55,29 +55,17 @@ jobs:
           SHEET_NAME: List1
         run: node perplexity-sheet-to-github.js
 
+      # ✅ Vytvoř skeleton a vypni Jekyll (.nojekyll) – používá jeden printf %b (bez problematických koncových zpětných lomítek)
       - name: Ensure docs skeleton
         shell: bash
         run: |
           mkdir -p docs
           touch docs/.nojekyll
           if [ ! -f docs/index.html ]; then
-            printf '%s\n' \
-'<!doctype html>' \
-'<meta charset="utf-8">' \
-'<meta name="viewport" content="width=device-width,initial-scale=1">' \
-'<title>Mounjaro Summaries</title>' \
-'<link rel="stylesheet" href="./styles.css">' \
-'<div class="container">' \
-'  <h1>Mounjaro Summaries</h1>' \
-'  <p>Obsah se sem doplní po běhu workflow.</p>' \
-'</div>' \
-> docs/index.html
+            printf %b '<!doctype html>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>Mounjaro Summaries</title>\n<link rel="stylesheet" href="./styles.css">\n<div class="container">\n  <h1>Mounjaro Summaries</h1>\n  <p>Obsah se sem doplní po běhu workflow.</p>\n</div>\n' > docs/index.html
           fi
           if [ ! -f docs/styles.css ]; then
-            printf '%s\n' \
-'body{font:16px/1.6 system-ui,Segoe UI,Roboto,Arial;margin:0;padding:24px}' \
-'.container{max-width:900px;margin:0 auto}' \
-> docs/styles.css
+            printf %b 'body{font:16px/1.6 system-ui,Segoe UI,Roboto,Arial;margin:0;padding:24px}\n.container{max-width:900px;margin:0 auto}\n' > docs/styles.css
           fi
 
       - name: Commit website updates (docs/)
