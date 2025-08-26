@@ -22,11 +22,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # explicitně předáme token a plný fetch (lepší pro rebase)
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      # Zapis service-account JSON doslova (zachová uvozovky i řádky)
+      # Zapiš service-account JSON doslova (zachová uvozovky i řádky)
       - name: Write google-service-account.json from secret
         shell: bash
         run: |
@@ -42,7 +41,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20.x'
-          # cache: 'npm'  # ⚠️ vypnuto, protože nemáš package-lock.json
+          # cache: 'npm'  # necháno vypnuté, pokud v repu není package-lock.json
 
       - name: Install dependencies
         run: npm ci || npm install
@@ -51,25 +50,30 @@ jobs:
         env:
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Volitelně přepiš název listu; když vynecháš, skript si ho najde sám
           SHEET_ID: 1KgrYXHpVfTAGQZT6f15aARGCQ-qgNQZM4HWQCiqt14s
           SHEET_NAME: List1
         run: node perplexity-sheet-to-github.js
 
-      # Robustní commit & push změn v docs/
+      # Commit & push změn statického webu v docs/ (index.html, posts.json, styles.css)
       - name: Commit website updates (docs/)
         if: always()
         env:
-          BRANCH_NAME: ${{ github.ref_name }} # např. 'main' při schedule/push
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
           set -e
           git config --global user.name  "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-          # Ujisti se, že jsme na správné větvi
           git checkout "$BRANCH_NAME"
 
-          # Přidej změny v docs/
+          # Pokud skript nic nevytvořil, slušně skonči
+          if [ ! -d docs ]; then
+            echo "No docs/ directory generated — skipping commit."
+            exit 0
+          fi
+
           git add docs
 
           # Když není co commitnout, skonči bez chyby
