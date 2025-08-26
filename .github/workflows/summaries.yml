@@ -21,8 +21,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # explicitně předáme token a plný fetch (lepší pro rebase)
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
-      # Zapíše service-account JSON doslova (zachová uvozovky i řádky)
+      # Zapis service-account JSON doslova (zachová uvozovky i řádky)
       - name: Write google-service-account.json from secret
         shell: bash
         run: |
@@ -31,7 +35,6 @@ jobs:
           JSON
           chmod 600 google-service-account.json
 
-      # Rychlá validace JSON (neleakuje obsah)
       - name: Validate service account JSON
         run: node -e "const fs=require('fs');JSON.parse(fs.readFileSync('google-service-account.json','utf8'));console.log('Service account OK');"
 
@@ -39,7 +42,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20.x'
-          cache: 'npm'
+          # cache: 'npm'  # ⚠️ vypnuto, protože nemáš package-lock.json
 
       - name: Install dependencies
         run: npm ci || npm install
@@ -48,17 +51,35 @@ jobs:
         env:
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Volitelně přepiš název listu; když vynecháš, skript si ho najde sám
           SHEET_ID: 1KgrYXHpVfTAGQZT6f15aARGCQ-qgNQZM4HWQCiqt14s
           SHEET_NAME: List1
         run: node perplexity-sheet-to-github.js
 
-      # Commitne a pushne změny statického webu v docs/ (index.html, posts.json, styles.css)
+      # Robustní commit & push změn v docs/
       - name: Commit website updates (docs/)
         if: always()
+        env:
+          BRANCH_NAME: ${{ github.ref_name }} # např. 'main' při schedule/push
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -e
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # Ujisti se, že jsme na správné větvi
+          git checkout "$BRANCH_NAME"
+
+          # Přidej změny v docs/
           git add docs
-          git diff --cached --quiet || git commit -m "Update website (docs) [skip ci]"
-          git push
+
+          # Když není co commitnout, skonči bez chyby
+          if git diff --cached --quiet; then
+            echo "No changes in docs/ — nothing to commit."
+            exit 0
+          fi
+
+          # Rebase proti remote, ať push nepadá na non-fast-forward
+          git pull --rebase origin "$BRANCH_NAME" || true
+
+          git commit -m "Update website (docs) [skip ci]"
+          git push origin HEAD:"$BRANCH_NAME"
