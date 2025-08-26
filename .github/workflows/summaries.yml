@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'docs/**'
+      - 'summaries/**'
   schedule:
     - cron: "0 8 * * *"  # 08:00 UTC
 
@@ -25,17 +28,32 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Write google-service-account.json from secret
+      # Podpora dvou secretů: GOOGLE_SERVICE_ACCOUNT_JSON (raw) nebo GOOGLE_SERVICE_ACCOUNT_JSON_B64 (base64)
+      - name: Write & validate google-service-account.json (plain or base64)
         shell: bash
+        env:
+          SVC_RAW: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SVC_B64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_B64 }}
         run: |
-          cat > google-service-account.json <<'JSON'
-          ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          JSON
+          set -euo pipefail
+          if [ -n "${SVC_RAW:-}" ] && [ "${SVC_RAW:0:1}" = "{" ]; then
+            printf '%s' "$SVC_RAW" > google-service-account.json
+            echo "Wrote service account from plain JSON secret."
+          elif [ -n "${SVC_B64:-}" ]; then
+            echo "$SVC_B64" | base64 -d > google-service-account.json
+            echo "Wrote service account from base64 secret."
+          else
+            echo "ERROR: No valid GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_JSON_B64 provided."
+            exit 1
+          fi
+          bytes=$(wc -c < google-service-account.json || echo 0)
+          echo "service-account.json size: ${bytes} bytes"
+          if [ "$bytes" -lt 100 ]; then
+            echo "ERROR: service-account.json looks too small — secret is likely truncated."
+            exit 1
+          fi
+          node -e "const fs=require('fs');JSON.parse(fs.readFileSync('google-service-account.json','utf8'));console.log('Service account OK');"
           chmod 600 google-service-account.json
-
-      - name: Validate service account JSON
-        shell: bash
-        run: node -e "const fs=require('fs');JSON.parse(fs.readFileSync('google-service-account.json','utf8'));console.log('Service account OK');"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -52,13 +70,11 @@ jobs:
           npm config set fetch-retries 5
           npm config set fetch-retry-mintimeout 20000
           npm config set fetch-retry-maxtimeout 120000
-
           if [ -f package-lock.json ]; then
             CMD="npm ci --no-audit --no-fund"
           else
             CMD="npm install --no-audit --no-fund"
           fi
-
           success=""
           for registry in https://registry.npmjs.org/ https://registry.yarnpkg.com/ https://registry.npmmirror.com/; do
             echo "Trying registry: $registry"
@@ -73,13 +89,12 @@ jobs:
               sleep $((attempt * 10))
             done
           done
-
           if [ -z "$success" ]; then
             echo "Install failed across all registries."
             exit 1
           fi
 
-      # Doplní runtime balíčky používané ve skriptu
+      # Dočasné doplnění runtime knihoven (pokud nejsou v package.json)
       - name: Install runtime extras (jsdom, readability, normalize-url)
         shell: bash
         run: |
@@ -89,7 +104,6 @@ jobs:
           npm config set fetch-retries 5
           npm config set fetch-retry-mintimeout 20000
           npm config set fetch-retry-maxtimeout 120000
-
           success=""
           for registry in https://registry.npmjs.org/ https://registry.yarnpkg.com/ https://registry.npmmirror.com/; do
             echo "Trying registry for extras: $registry"
@@ -104,13 +118,12 @@ jobs:
               sleep $((attempt * 10))
             done
           done
-
           if [ -z "$success" ]; then
             echo "Extras install failed across all registries."
             exit 1
           fi
 
-      # Opraví kolizi: když existuje SOUBOR 'summaries', přejmenuje ho a založí složku
+      # Opraví případnou kolizi: soubor 'summaries' vs. složka 'summaries/'
       - name: Ensure summaries/ directory (fix conflicts)
         shell: bash
         env:
@@ -164,3 +177,42 @@ jobs:
           set -e
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          git checkout "$BRANCH_NAME"
+
+          if [ ! -d docs ]; then
+            echo "No docs/ directory generated — skipping commit."
+            exit 0
+          fi
+
+          git add docs
+
+          if git diff --cached --quiet; then
+            echo "No changes in docs/ — nothing to commit."
+            exit 0
+          fi
+
+          # 1) commit lokálních změn (BEZ [skip ci], ať proběhne Pages build)
+          git commit -m "Update website (docs)"
+
+          # 2) srovnání se vzdálenou větví
+          git fetch origin "$BRANCH_NAME"
+          if ! git rebase "origin/$BRANCH_NAME"; then
+            echo "Rebase failed, falling back to a merge pull…"
+            git rebase --abort || true
+            git pull --no-rebase origin "$BRANCH_NAME"
+          fi
+
+          # 3) push s retriem při závodu
+          for attempt in 1 2 3; do
+            if git push origin HEAD:"$BRANCH_NAME"; then
+              echo "Pushed on attempt $attempt."
+              break
+            fi
+            echo "Push rejected, refetching and rebasing…"
+            git fetch origin "$BRANCH_NAME"
+            git rebase "origin/$BRANCH_NAME" || true
+            [ "$attempt" -eq 3 ] && exit 1
+            sleep $((attempt * 5))
+          done
