@@ -42,9 +42,34 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install dependencies
+      - name: Install dependencies (robust)
         shell: bash
-        run: npm ci || npm install
+        run: |
+          set -e
+          npm config set fund false
+          npm config set audit false
+          npm config set fetch-retries 5
+          npm config set fetch-retry-mintimeout 20000
+          npm config set fetch-retry-maxtimeout 120000
+
+          if [ -f package-lock.json ]; then
+            CMD="npm ci --no-audit --no-fund"
+          else
+            CMD="npm install --no-audit --no-fund"
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            echo "Attempt $attempt: $CMD"
+            if $CMD; then
+              echo "Dependencies installed."
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "Install failed after $attempt attempts."
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
 
       - name: Run summarizer script
         shell: bash
@@ -55,7 +80,6 @@ jobs:
           SHEET_NAME: List1
         run: node perplexity-sheet-to-github.js
 
-      # ✅ Vytvoř skeleton a vypni Jekyll (.nojekyll) – používá jeden printf %b (bez problematických koncových zpětných lomítek)
       - name: Ensure docs skeleton
         shell: bash
         run: |
