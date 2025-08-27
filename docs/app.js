@@ -1,14 +1,18 @@
 const PER_PAGE = 12;
 
 async function loadPosts(){
+  // cache busting, ať GitHub Pages neservíruje starý JSON
   const res = await fetch('posts.json?cb=' + Date.now(), { cache:'no-store' });
   if(!res.ok) throw new Error('posts.json load failed');
   return await res.json();
 }
 
 function fmtDate(iso){
-  try{ return new Date(iso).toLocaleDateString('cs-CZ',{year:'numeric',month:'2-digit',day:'2-digit'}); }
-  catch{ return iso; }
+  try{
+    return new Date(iso).toLocaleDateString('cs-CZ',{year:'numeric',month:'2-digit',day:'2-digit'});
+  }catch{
+    return iso;
+  }
 }
 
 function escapeHtml(s){return (s||'')
@@ -18,8 +22,21 @@ function escapeHtml(s){return (s||'')
   .replace(/\"/g,'&quot;')
   .replace(/'/g,'&#39;');}
 
+// Staré položky mohly mít relativní mdUrl (např. "summaries/2025-...md").
+// Převést je na absolutní GitHub blob URL, aby nevznikala 404 na Pages.
+function normalizeMdUrl(u){
+  if(!u) return '';
+  if(/^https?:\/\//i.test(u)) return u; // už je absolutní
+  if(u.startsWith('summaries/')){
+    return `https://github.com/OnLi1971/mounjaro-summaries/blob/main/${u}`;
+  }
+  // fallback: domov repa
+  return `https://github.com/OnLi1971/mounjaro-summaries`;
+}
+
 function fillSkeleton(){
   const list = document.getElementById('list');
+  if (!list) return;
   list.innerHTML = '';
   for(let i=0;i<6;i++){
     const el = document.createElement('div');
@@ -77,6 +94,8 @@ function renderPage(rows, page){
   const next = document.getElementById('next');
   const pageinfo = document.getElementById('pageinfo');
 
+  if(!list) return;
+
   const total = rows.length;
   if (count) count.textContent = `${total} ${pluralCZ(total,'záznam','záznamy','záznamů')}`;
 
@@ -93,6 +112,7 @@ function renderPage(rows, page){
     slice.forEach(p=>{
       const el = document.createElement('div');
       el.className = 'card';
+      const safeMdUrl = p.mdUrl ? normalizeMdUrl(p.mdUrl) : '';
       el.innerHTML = `
         <h3>${escapeHtml(p.title || 'Shrnutí')}</h3>
         <div class="meta">
@@ -101,8 +121,8 @@ function renderPage(rows, page){
         </div>
         <div class="summary">${escapeHtml((p.summary||'').slice(0, 800))}</div>
         <div class="actions">
-          <a class="primary" href="${p.sourceUrl}" target="_blank" rel="noopener">Přečíst zdroj</a>
-          <a href="${p.mdUrl}" target="_blank" rel="noopener">Plné shrnutí (GitHub)</a>
+          ${p.sourceUrl ? `<a class="primary" href="${p.sourceUrl}" target="_blank" rel="noopener">Přečíst zdroj</a>` : ''}
+          ${safeMdUrl ? `<a href="${safeMdUrl}" target="_blank" rel="noopener">Plné shrnutí (GitHub)</a>` : ''}
         </div>`;
       list.appendChild(el);
     });
