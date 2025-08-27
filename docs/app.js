@@ -1,7 +1,6 @@
 const PER_PAGE = 12;
 
 async function loadPosts(){
-  // cache busting, ať GitHub Pages neservíruje starý JSON
   const res = await fetch('posts.json?cb=' + Date.now(), { cache:'no-store' });
   if(!res.ok) throw new Error('posts.json load failed');
   return await res.json();
@@ -22,16 +21,15 @@ function escapeHtml(s){return (s||'')
   .replace(/\"/g,'&quot;')
   .replace(/'/g,'&#39;');}
 
-// Staré položky mohly mít relativní mdUrl (např. "summaries/2025-...md").
-// Převést je na absolutní GitHub blob URL, aby nevznikala 404 na Pages.
+// Když máme staré relativní mdUrl ("summaries/....md"), převeď na GitHub blob URL.
+// Když nepoznáme formát, vrať prázdný řetězec (nechceme falešný odkaz).
 function normalizeMdUrl(u){
   if(!u) return '';
-  if(/^https?:\/\//i.test(u)) return u; // už je absolutní
-  if(u.startsWith('summaries/')){
+  if(/^https?:\/\//i.test(u)) return u;             // už je absolutní
+  if(u.startsWith('summaries/')) {
     return `https://github.com/OnLi1971/mounjaro-summaries/blob/main/${u}`;
   }
-  // fallback: domov repa
-  return `https://github.com/OnLi1971/mounjaro-summaries`;
+  return ''; // neznámé -> žádný link
 }
 
 function fillSkeleton(){
@@ -112,7 +110,10 @@ function renderPage(rows, page){
     slice.forEach(p=>{
       const el = document.createElement('div');
       el.className = 'card';
-      const safeMdUrl = p.mdUrl ? normalizeMdUrl(p.mdUrl) : '';
+
+      // HREF pro „Plné shrnutí“: preferuj detailUrl, jinak GitHub blob
+      const summaryHref = (p.detailUrl && p.detailUrl.trim()) ? p.detailUrl.trim() : normalizeMdUrl(p.mdUrl);
+
       el.innerHTML = `
         <h3>${escapeHtml(p.title || 'Shrnutí')}</h3>
         <div class="meta">
@@ -122,7 +123,7 @@ function renderPage(rows, page){
         <div class="summary">${escapeHtml((p.summary||'').slice(0, 800))}</div>
         <div class="actions">
           ${p.sourceUrl ? `<a class="primary" href="${p.sourceUrl}" target="_blank" rel="noopener">Přečíst zdroj</a>` : ''}
-          ${safeMdUrl ? `<a href="${safeMdUrl}" target="_blank" rel="noopener">Plné shrnutí (GitHub)</a>` : ''}
+          ${summaryHref ? `<a href="${summaryHref}" target="_blank" rel="noopener">Plné shrnutí</a>` : ''}
         </div>`;
       list.appendChild(el);
     });
