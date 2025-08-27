@@ -91,7 +91,7 @@ async function translateToCzechViaPerplexity(text) {
   const response = await axios.post(
     'https://api.perplexity.ai/chat/completions',
     {
-      model: 'pplx-7b-chat',
+      model: 'sonar', // nebo 'sonar-pro'
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 900,
       temperature: 0.2,
