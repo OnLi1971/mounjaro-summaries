@@ -3,6 +3,11 @@ name: Backfill Czech summaries
 on:
   workflow_dispatch:
 
+# Zabraň paralením běhům, co by se přetahovaly o push
+concurrency:
+  group: backfill-czech-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -13,6 +18,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # ať máme historii pro rebase
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -29,18 +36,32 @@ jobs:
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
         run: node scripts/backfill-czech.js
 
-      - name: Commit changes
+      - name: Commit & push changes
         shell: bash
         run: |
           set -euo pipefail
+
           git config --global user.name  "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # Stáhni poslední main a rebase s autostash (zabrání "unstaged changes")
+          git fetch origin main
+          git -c rebase.autoStash=true pull --rebase origin main || true
+
+          # Přidej jen to, co nás zajímá
           git add docs/posts.json
+
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
+
           git commit -m "Backfill CZ summaries [skip ci]"
-          git pull --rebase origin main || true
-          git push origin HEAD:main
+
+          # Ještě jednou rebáznout pro jistotu, kdyby mezitím něco přibylo
+          git fetch origin main
+          git -c rebase.autoStash=true pull --rebase origin main || true
+
+          # Bezpečný push
+          git push --force-with-lease origin HEAD:main
