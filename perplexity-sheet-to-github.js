@@ -65,7 +65,7 @@ async function getSummaryPerplexityCz(text) {
   ].join('\n');
 
   const response = await axios.post(
-    'https://api.perplexity.ai/v1/chat/completions',
+    'https://api.perplexity.ai/chat/completions',
     {
       model: 'pplx-7b-chat',
       messages: [{ role: 'user', content: prompt }],
@@ -89,7 +89,7 @@ async function getSummaryPerplexityCz(text) {
 async function translateToCzechViaPerplexity(text) {
   const prompt = `Přelož do češtiny. Vrať jen překlad, bez jakýchkoli poznámek:\n\n${text}`;
   const response = await axios.post(
-    'https://api.perplexity.ai/v1/chat/completions',
+    'https://api.perplexity.ai/chat/completions',
     {
       model: 'pplx-7b-chat',
       messages: [{ role: 'user', content: prompt }],
