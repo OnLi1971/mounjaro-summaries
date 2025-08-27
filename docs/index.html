@@ -3,51 +3,32 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta name="theme-color" content="#0b0f14">
   <title>Mounjaro Summaries</title>
   <meta name="description" content="Denní shrnutí článků o GLP-1 / Mounjaro.">
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="site-header">
-    <div class="wrap headbar">
-      <div class="brand">
-        <h1>Mounjaro Summaries</h1>
-        <p class="subtitle">Denně 1–2 nové články • AI shrnutí • Přímý odkaz na zdroj</p>
-      </div>
-      <nav class="quicklinks">
-        <a class="ql" href="https://github.com/OnLi1971/mounjaro-summaries" target="_blank" rel="noopener">GitHub</a>
-      </nav>
+    <div class="wrap">
+      <h1>Mounjaro Summaries</h1>
+      <p class="subtitle">Denně 1–2 nové články • AI shrnutí • Přímý odkaz na zdroj</p>
     </div>
   </header>
 
   <main class="wrap">
-    <section class="controls">
-      <input id="search" type="search" placeholder="Hledat v titulcích a shrnutí…" aria-label="Hledat">
-      <select id="source" aria-label="Filtrovat podle zdroje">
+    <div id="filters" class="filters">
+      <input id="search" type="search" placeholder="Hledat v titulcích a shrnutí…" />
+      <select id="source">
         <option value="">Všechny zdroje</option>
       </select>
-      <select id="sort" aria-label="Seřadit">
-        <option value="new">Nejnovější</option>
-        <option value="old">Nejstarší</option>
-      </select>
-      <span id="count" class="count">0 záznamů</span>
-    </section>
-
-    <section id="list" class="grid" aria-live="polite"></section>
-
-    <div id="pager" class="pager">
-      <button id="prev" disabled>Předchozí</button>
-      <span id="pageinfo">1 / 1</span>
-      <button id="next" disabled>Další</button>
     </div>
+
+    <div id="list" class="grid"></div>
+
+    <footer class="site-footer">
+      <p>Publikováno automaticky • <a href="https://github.com/OnLi1971/mounjaro-summaries" target="_blank" rel="noopener">GitHub repo</a></p>
+    </footer>
   </main>
-
-  <footer class="site-footer">
-    <div class="wrap">
-      <p>Publikováno automaticky přes GitHub Actions • Posledních 200 položek • <a href="https://github.com/OnLi1971/mounjaro-summaries" target="_blank" rel="noopener">repozitář</a></p>
-    </div>
-  </footer>
 
   <script src="app.js"></script>
 </body>
