@@ -1,16 +1,21 @@
 const PER_PAGE = 12;
 
+// zap/vyp debug řádku pod kartami
+const DEBUG = true;
+
 async function loadPosts(){
   const res = await fetch('posts.json?cb=' + Date.now(), { cache:'no-store' });
   if(!res.ok) throw new Error('posts.json load failed');
-  return await res.json();
+  const json = await res.json();
+  console.log('[posts.json] loaded', json.length);
+  return json;
 }
 
 function fmtDate(iso){
   try{
     return new Date(iso).toLocaleDateString('cs-CZ',{year:'numeric',month:'2-digit',day:'2-digit'});
   }catch{
-    return iso;
+    return iso || '';
   }
 }
 
@@ -21,15 +26,29 @@ function escapeHtml(s){return (s||'')
   .replace(/\"/g,'&quot;')
   .replace(/'/g,'&#39;');}
 
-// Když máme staré relativní mdUrl ("summaries/....md"), převeď na GitHub blob URL.
-// Když nepoznáme formát, vrať prázdný řetězec (nechceme falešný odkaz).
+// Najdi potenciální MD URL v různých polích, která mohla vzniknout dřívějšími verzemi
+function pickRawMdUrl(p){
+  if (p.mdUrl) return p.mdUrl;
+  if (p.md_url) return p.md_url;
+  if (p.markdownUrl) return p.markdownUrl;
+  if (p.mdPath) return p.mdPath;
+  if (p.md_path) return p.md_path;
+  return '';
+}
+
+// Převést relativní cestu na GitHub blob URL; když nic rozumného, vrať prázdný řetězec
 function normalizeMdUrl(u){
   if(!u) return '';
-  if(/^https?:\/\//i.test(u)) return u;             // už je absolutní
-  if(u.startsWith('summaries/')) {
-    return `https://github.com/OnLi1971/mounjaro-summaries/blob/main/${u}`;
+  const s = String(u).trim();
+  if(!s) return '';
+  if(/^https?:\/\//i.test(s)) return s; // už je absolutní
+  // nejčastější případ: "summaries/2025-08-27-xxxxxx.md" (nebo se leading slash)
+  const rel = s.replace(/^\/+/, '');
+  if(rel.toLowerCase().startsWith('summaries/')){
+    return `https://github.com/OnLi1971/mounjaro-summaries/blob/main/${rel}`;
   }
-  return ''; // neznámé -> žádný link
+  // nic, co bychom bezpečně převedli
+  return '';
 }
 
 function fillSkeleton(){
@@ -111,8 +130,14 @@ function renderPage(rows, page){
       const el = document.createElement('div');
       el.className = 'card';
 
-      // HREF pro „Plné shrnutí“: preferuj detailUrl, jinak GitHub blob
-      const summaryHref = (p.detailUrl && p.detailUrl.trim()) ? p.detailUrl.trim() : normalizeMdUrl(p.mdUrl);
+      // preferuj detailUrl (pokud generuješ HTML detail), jinak GitHub blob MD
+      const rawMd = pickRawMdUrl(p);
+      const mdHref = normalizeMdUrl(rawMd);
+      const summaryHref = (p.detailUrl && String(p.detailUrl).trim()) ? String(p.detailUrl).trim() : mdHref;
+
+      if (DEBUG){
+        console.log('[card]', {title:p.title, detailUrl:p.detailUrl, mdUrl:p.mdUrl, alt: {md_url:p.md_url, mdPath:p.mdPath, md_path:p.md_path, markdownUrl:p.markdownUrl}, resolved: summaryHref});
+      }
 
       el.innerHTML = `
         <h3>${escapeHtml(p.title || 'Shrnutí')}</h3>
@@ -124,7 +149,10 @@ function renderPage(rows, page){
         <div class="actions">
           ${p.sourceUrl ? `<a class="primary" href="${p.sourceUrl}" target="_blank" rel="noopener">Přečíst zdroj</a>` : ''}
           ${summaryHref ? `<a href="${summaryHref}" target="_blank" rel="noopener">Plné shrnutí</a>` : ''}
-        </div>`;
+        </div>
+        ${DEBUG ? `<div style="font-size:12px;color:#8aa2b7;margin-top:6px">
+          debug: detailUrl=${escapeHtml(p.detailUrl||'')} · rawMd=${escapeHtml(rawMd||'')} · resolved=${escapeHtml(summaryHref||'')}
+        </div>` : ''}`;
       list.appendChild(el);
     });
   }
