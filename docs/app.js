@@ -43,9 +43,8 @@ function render(posts){
         </div>
         <div class="summary">${escapeHtml((p.summary||'').slice(0,600))}</div>
         <div class="actions">
-          <a href="${p.sourceUrl}" target="_blank" rel="noopener">Přečíst zdroj</a>
-          <a href="${p.mdUrl}" target="_blank" rel="noopener">Plné shrnutí (GitHub)</a>
-        </div>`;
+  ${p.sourceUrl ? `<a class="primary" href="${p.sourceUrl}" target="_blank" rel="noopener">Přečíst zdroj</a>` : ''}
+</div>
       list.appendChild(el);
     })
   }
