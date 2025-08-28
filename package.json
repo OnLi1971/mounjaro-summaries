@@ -16,9 +16,9 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "axios": "^1.6.0",
-    "cheerio": "^1.0.0-rc.12",
     "@octokit/rest": "^20.0.0",
+    "axios": "^1.11.0",
+    "cheerio": "^1.0.0-rc.12",
     "dotenv": "^16.0.0",
     "googleapis": "^133.0.0"
   }
