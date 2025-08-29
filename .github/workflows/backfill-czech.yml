@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
 
-# nespouštěj paralelně
+# nepouštěj paralelně
 concurrency:
   group: sheet-publish
   cancel-in-progress: true
@@ -21,22 +21,30 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create Google service account JSON
-        run: printf '%s' "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}" > google-service-account.json
+      # Vytvoř google-service-account.json ze secretu a oprav \n v private_key
+      - name: Create google-service-account.json
+        shell: bash
+        run: |
+          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' \
+          | jq '.private_key |= gsub("\\n"; "\n")' \
+          > google-service-account.json
+
+          # Sanity check
+          node -e "const fs=require('fs');const o=JSON.parse(fs.readFileSync('google-service-account.json','utf8'));console.log('type=',o.type,'email=',o.client_email);console.log('pk head=',o.private_key.split('\n')[0]);"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'        # funguje, pokud je v repu package-lock.json
+          cache: 'npm'  # funguje, když je v repu package-lock.json
 
       - name: Install dependencies
         run: npm ci || npm install
 
-      # pokud lockfile chybí a npm install ho vygeneruje, commitni ho pro stabilní buildy příště
+      # (volitelné) pokud by lockfile vznikl nově, commitni ho pro stabilní buildy
       - name: Commit package-lock.json if newly generated
+        shell: bash
         run: |
-          set -euo pipefail
           if ! git ls-files --error-unmatch package-lock.json >/dev/null 2>&1; then
             if [ -f package-lock.json ]; then
               git config user.name  "github-actions[bot]"
@@ -54,6 +62,7 @@ jobs:
         run: node perplexity-sheet-to-github.js
 
       - name: Commit docs/ if changed
+        shell: bash
         run: |
           set -euo pipefail
           git config --global user.name  "github-actions[bot]"
