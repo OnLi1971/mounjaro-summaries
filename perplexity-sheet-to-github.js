@@ -1,493 +1,389 @@
 // perplexity-sheet-to-github.js
-// -------------------------------------------------------------
-// Manuální publikace:
-// - Každému řádku nejdřív ověříme/vyrobíme české shrnutí v L (CS_SUMMARY)
-//   a nastavíme status REVIEW.
-// - Publikujeme POUZE řádky s K (PUBLISH?) = TRUE a prázdným M (PUBLISHED_AT).
-// - Po publikaci: H=PUBLISHED, I=MD URL, M=timestamp, N=CARD_ID, J=NOTE.
-// - Zápisy do Sheets jsou frontované (batchUpdate) s retry/backoff.
-// -------------------------------------------------------------
+// RUNNING manual-gate v3.2 – K=TRUE + J empty => publish; L (CZ_SUMMARY) se vždy snažíme mít česky
 
 require('dotenv').config({ path: './summaries.env' });
 
-const fs = require('fs');
-const path = require('path');
 const { google } = require('googleapis');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { Octokit } = require('@octokit/rest');
+const fs = require('fs');
+const path = require('path');
 
-// ---- Konfigurace env / repozitáře ----
-const perplexityApiKey = process.env.PERPLEXITY_API_KEY || '';
-const githubToken = process.env.GITHUB_TOKEN;
+// ==== CONFIG =================================================================
 
-const owner = 'OnLi1971';
-const repo  = 'mounjaro-summaries';
-const branch = 'main';
-const summariesDir = 'summaries';
-
-// ---- Google Sheets ----
 const SPREADSHEET_ID = '1KgrYXHpVfTAGQZT6f15aARGCQ-qgNQZM4HWQCiqt14s';
-const SHEET_NAME     = 'List 1'; // přesně takhle (s mezerou)
+const SHEET_NAME = 'List 1'; // přesný název listu
+const READ_RANGE = `'${SHEET_NAME}'!A:N`; // bereme souvislý blok A..N
 
-// Sloupce:
-// A = Datum
-// D = URL
-// H = Status (REVIEW | PUBLISHED | ERROR | SKIP_...)
-// I = MD URL
-// J = NOTE
-// K = PUBLISH? (TRUE/FALSE)  ← klikáš ručně
-// L = CS_SUMMARY (náhled shrnutí v češtině)
-// M = PUBLISHED_AT (ISO timestamp)  ← vyplní skript
-// N = CARD_ID (id karty na webu)    ← vyplní skript
+// Indexy sloupců (0-based)
+const COL = {
+  DATE: 0,            // A
+  SOURCE: 1,          // B
+  TITLE: 2,           // C
+  URL: 3,             // D
+  FULLTEXT: 4,        // E (nepovinné)
+  TRANS_SUM: 5,       // F (nepovinné)
+  IS_CZ: 6,           // G
+  STATUS: 7,          // H (OK / OK_FALLBACK / ERROR / SKIP_…)
+  MD_URL: 8,          // I (GitHub MD soubor)
+  PUBLISHED_AT: 9,    // J
+  PUBLISH: 10,        // K (TRUE => publikovat)
+  CZ_SUMMARY: 11      // L (české shrnutí pro rozhodování i web)
+};
+
+// seznam domén, které nechceme publikovat
+const BLOCKED_DOMAINS = new Set([
+  'thesun.co.uk',
+  'uk.news.yahoo.com',
+  'community.whattoexpect.com',
+  'shefinds.com',
+  'gwa-prod-pxm-api.s3.amazonaws.com',
+  'the-independent.com',
+  'theindependent.com'
+]);
+
+// Web output (statický web)
+const DOCS_DIR = path.join(process.cwd(), 'docs');
+const POSTS_JSON = path.join(DOCS_DIR, 'posts.json');
+
+// GitHub output (Markdown soubory)
+const GH_OWNER = 'OnLi1971';
+const GH_REPO = 'mounjaro-summaries';
+const GH_BRANCH = 'main';
+const SUMMARIES_DIR = 'summaries';
+
+// Perplexity
+const PPLX_KEY = process.env.PERPLEXITY_API_KEY;
+
+// ==== AUTH ===================================================================
 
 const auth = new google.auth.GoogleAuth({
   keyFile: 'google-service-account.json',
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  scopes: ['https://www.googleapis.com/auth/spreadsheets']
 });
 
-// ---- Heuristiky & limity ----
-const MIN_CHARS   = 900;
-const RESPECT_DAY_LIMIT = false; // manuální režim: denní limit vypnutý
-const MAX_PER_DAY = 2;
-
-// Blokované domény (nepublikovat)
-const DOMAIN_BLOCKLIST = new Set([
-  'gwa-prod-pxm-api.s3.amazonaws.com',
-  'community.whattoexpect.com',
-  'shefinds.com',
-  'uk.news.yahoo.com',
-  'thesun.co.uk',
-  'the-independent.com',
-]);
-
-// -------------------------------------------------------------
-// Pomocné funkce
-// -------------------------------------------------------------
-function hostOf(u){ try { return new URL(u).hostname.replace(/^www\./,''); } catch { return ''; } }
-function randId(n=6){ return Math.random().toString(36).slice(2, 2+n); }
-
-function ensureDocsScaffold(){
-  if (!fs.existsSync('docs')) fs.mkdirSync('docs', { recursive:true });
-  const postsPath = path.join('docs','posts.json');
-  if (!fs.existsSync(postsPath)) fs.writeFileSync(postsPath, '[]', 'utf8');
+function octokit() {
+  return new Octokit({ auth: process.env.GITHUB_TOKEN });
 }
 
-function toDayKey(date){
-  const d = (date instanceof Date) ? date : new Date(date);
-  return isNaN(d) ? new Date().toISOString().slice(0,10) : d.toISOString().slice(0,10);
+// ==== UTILS ==================================================================
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function nowIso() { return new Date().toISOString(); }
+
+function randId(n = 6) {
+  return Math.random().toString(36).slice(2, 2 + n);
 }
 
-function parseSheetDate(s){
-  if (!s) return null;
-  if (typeof s === 'number'){ // Google seriálové číslo
-    const epoch = new Date(Math.round((s - 25569) * 86400 * 1000));
-    return isNaN(epoch) ? null : epoch;
-  }
-  const m = String(s).trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
-  if (!m) return null;
-  const [ , dd, mm, yyyy, hh='12', mi='00', ss='00'] = m;
-  const d = new Date(Number(yyyy), Number(mm)-1, Number(dd), Number(hh), Number(mi), Number(ss));
-  return isNaN(d) ? null : d;
-}
-
-function isCzech(s = '') {
-  return /[áéěíóúůýžščřďťňÁÉĚÍÓÚŮÝŽŠČŘĎŤŇ]/.test(s);
-}
-function looksHtml(s=''){ return /<[^>]+>/.test(s); }
-function stripHtml(s=''){ return s.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim(); }
-
-// -------------------------------------------------------------
-// Sheets write queue (batchUpdate + backoff) — proti HTTP 429
-// -------------------------------------------------------------
-const SHEET_BATCH_SIZE = 50;
-const SHEET_MAX_RETRIES = 6;
-const SHEET_QUEUE = [];
-
-async function sheetsClient(){
-  const client = await auth.getClient();
-  return google.sheets({ version:'v4', auth: client });
-}
-
-async function queueSheetUpdate(range, valuesArr) {
-  SHEET_QUEUE.push({ range, values: valuesArr });
-  if (SHEET_QUEUE.length >= SHEET_BATCH_SIZE) {
-    await flushSheetUpdates();
-  }
-}
-
-async function flushSheetUpdates() {
-  if (SHEET_QUEUE.length === 0) return;
-  const svc = await sheetsClient();
-
-  while (SHEET_QUEUE.length) {
-    const chunk = SHEET_QUEUE.splice(0, SHEET_BATCH_SIZE);
-    const data = chunk.map(u => ({ range: u.range, values: [u.values] })); // 1 řádek per range
-
-    let attempt = 0;
-    for (;;) {
-      try {
-        await svc.spreadsheets.values.batchUpdate({
-          spreadsheetId: SPREADSHEET_ID,
-          valueInputOption: 'RAW',
-          requestBody: { data },
-        });
-        break; // OK
-      } catch (e) {
-        const status = e?.response?.status || e?.code;
-        if (status === 429 || status === 503) {
-          const retryAfter = parseInt(e?.response?.headers?.['retry-after'] || '0', 10);
-          const delay = retryAfter > 0 ? retryAfter * 1000 : Math.min(32000, 1000 * Math.pow(2, attempt));
-          attempt++;
-          if (attempt > SHEET_MAX_RETRIES) {
-            console.error('Sheets batchUpdate exceeded retries; failing chunk.', e.message || e);
-            throw e;
-          }
-          console.warn(`Sheets ${status} — retrying in ${Math.round(delay/1000)}s (attempt ${attempt})`);
-          await new Promise(r => setTimeout(r, delay));
-          continue;
-        }
-        throw e; // jiná chyba
-      }
-    }
-  }
-}
-
-// -------------------------------------------------------------
-// Sheets I/O — načtení řádků a zapisovací helper
-// -------------------------------------------------------------
-async function getSheetRows(){
-  const svc = await sheetsClient();
-
-  const res = await svc.spreadsheets.values.batchGet({
-    spreadsheetId: SPREADSHEET_ID,
-    ranges: [
-      `${SHEET_NAME}!A2:A`,  // datum
-      `${SHEET_NAME}!D2:D`,  // url
-      `${SHEET_NAME}!H2:H`,  // status
-      `${SHEET_NAME}!I2:I`,  // md url
-      `${SHEET_NAME}!J2:J`,  // note
-      `${SHEET_NAME}!K2:K`,  // publish?
-      `${SHEET_NAME}!L2:L`,  // cs_summary
-      `${SHEET_NAME}!M2:M`,  // published_at
-      `${SHEET_NAME}!N2:N`,  // card_id
-    ],
-  });
-
-  const A = res.data.valueRanges?.[0]?.values || [];
-  const D = res.data.valueRanges?.[1]?.values || [];
-  const H = res.data.valueRanges?.[2]?.values || [];
-  const I = res.data.valueRanges?.[3]?.values || [];
-  const J = res.data.valueRanges?.[4]?.values || [];
-  const K = res.data.valueRanges?.[5]?.values || [];
-  const L = res.data.valueRanges?.[6]?.values || [];
-  const M = res.data.valueRanges?.[7]?.values || [];
-  const N = res.data.valueRanges?.[8]?.values || [];
-
-  const max = Math.max(A.length,D.length,H.length,I.length,J.length,K.length,L.length,M.length,N.length);
-  const out = [];
-  for (let i=0;i<max;i++){
-    out.push({
-      rowNumber   : i+2,
-      createdAtRaw: (A[i]?.[0] || '').trim(),
-      url         : (D[i]?.[0] || '').trim(),
-      status      : (H[i]?.[0] || '').trim(),
-      mdUrl       : (I[i]?.[0] || '').trim(),
-      note        : (J[i]?.[0] || '').trim(),
-      publishFlag : (K[i]?.[0] || '').toString().toUpperCase() === 'TRUE',
-      csSummary   : (L[i]?.[0] || '').trim(),
-      publishedAt : (M[i]?.[0] || '').trim(),
-      cardId      : (N[i]?.[0] || '').trim(),
-    });
-  }
-  return out;
-}
-
-// zapisuje do H..J a/nebo L..N přes frontu
-async function setRow(rangeFromColHtoN, rowNumber, { status, mdUrl='', note='', publishAt='', cardId='', csSummary=null }){
-  if (rangeFromColHtoN){
-    // H..J (status, mdUrl, note)
-    await queueSheetUpdate(`${SHEET_NAME}!H${rowNumber}:J${rowNumber}`, [status, mdUrl, note]);
-    // L..N (csSummary, publishedAt, cardId) — K (checkbox) nenecháváme měnit
-    await queueSheetUpdate(`${SHEET_NAME}!L${rowNumber}:N${rowNumber}`, [csSummary ?? '', publishAt, cardId]);
-  } else {
-    // jen H..J
-    await queueSheetUpdate(`${SHEET_NAME}!H${rowNumber}:J${rowNumber}`, [status, mdUrl, note]);
-  }
-}
-
-// -------------------------------------------------------------
-// Scraping & shrnutí
-// -------------------------------------------------------------
-async function getArticleData(url){
-  const res = await axios.get(url, {
-    headers:{
-      'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-      'Accept-Language':'en;q=0.8,en-GB;q=0.7,cs;q=0.6',
-    },
-    timeout: 15000,
-    maxRedirects: 5,
-    validateStatus: s => (s>=200 && s<400) || s===403 || s===404,
-  });
-
-  if (res.status===403) throw new Error('HTTP 403');
-  if (res.status===404) throw new Error('HTTP 404');
-
-  const html = res.data;
-  const $ = cheerio.load(html);
-
-  const title =
-    $('meta[property="og:title"]').attr('content')?.trim()
-    || $('meta[name="twitter:title"]').attr('content')?.trim()
-    || $('title').first().text().trim()
-    || '';
-
-  let text = '';
-  $('p').each((_, el) => {
-    const t = $(el).text().replace(/\s+/g,' ').trim();
-    if (t) text += t + '\n';
-  });
-  text = text.trim();
-
-  return { title, text: text.slice(0,8000) };
-}
-
-async function getSummaryPerplexity(text){
-  if (!perplexityApiKey) throw new Error('Missing PERPLEXITY_API_KEY');
-  const prompt = `Shrň česky do 6–8 odrážek.
-- Odpovídej **pouze česky**.
-- Žádný úvod ani závěr, jen odrážky.
----
-${text}`;
-  const resp = await axios.post(
-    'https://api.perplexity.ai/v1/chat/completions',
-    {
-      model: 'pplx-7b-chat',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 650,
-      temperature: 0.2,
-    },
-    {
-      headers: { Authorization: `Bearer ${perplexityApiKey}`, 'Content-Type': 'application/json' },
-      timeout: 20000,
-    }
-  );
-  return resp.data?.choices?.[0]?.message?.content?.trim() || '';
-}
-
-async function translateToCzechWithPerplexity(text) {
-  if (!perplexityApiKey) throw new Error('Missing PERPLEXITY_API_KEY');
-  const prompt = `Přelož následující text do **češtiny** a zachovej odrážky/strukturu. Vrať **jen text**, bez úvodu:\n\n${text}`;
-  const resp = await axios.post(
-    'https://api.perplexity.ai/v1/chat/completions',
-    {
-      model: 'pplx-7b-chat',
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 700,
-      temperature: 0.1,
-    },
-    {
-      headers: { Authorization: `Bearer ${perplexityApiKey}`, 'Content-Type': 'application/json' },
-      timeout: 20000,
-    }
-  );
-  return resp.data?.choices?.[0]?.message?.content?.trim() || '';
-}
-
-// -------------------------------------------------------------
-// GitHub MD
-// -------------------------------------------------------------
-async function saveToGitHub({ title, url, summary }){
-  const octokit = new Octokit({ auth: githubToken });
-  const date = new Date().toISOString().slice(0,10);
-  const baseName = `${date}-${randId(6)}`;
-  const mdPath = `${summariesDir}/${baseName}.md`;
-
-  const body = [
-    `# ${title || 'Shrnutí článku'}`,
-    ``,
-    `Zdroj: [${url}](${url})`,
-    ``,
-    `${summary || ''}`,
-    ``,
-  ].join('\n');
-
-  const content = Buffer.from(body,'utf8').toString('base64');
-
-  try{
-    await octokit.repos.createOrUpdateFileContents({
-      owner, repo, path: mdPath, message: `Add summary: ${title || url}`, content, branch,
-    });
-    return `https://github.com/${owner}/${repo}/blob/${branch}/${mdPath}`;
-  }catch(e){
-    if (e?.status===409){
-      const altPath = `${summariesDir}/${date}-${randId(8)}.md`;
-      await octokit.repos.createOrUpdateFileContents({
-        owner, repo, path: altPath, message: `Add summary: ${title || url}`, content, branch,
-      });
-      return `https://github.com/${owner}/${repo}/blob/${branch}/${altPath}`;
-    }
-    throw e;
-  }
-}
-
-// -------------------------------------------------------------
-// Web (docs/) – přidání karty; vrací {added, id, reason}
-// -------------------------------------------------------------
-function updateDocsSite({ title, dateISO, sourceUrl, sourceHost, mdUrl, summary }){
-  ensureDocsScaffold();
-  const postsPath = path.join('docs','posts.json');
-
-  let posts = [];
-  try { posts = JSON.parse(fs.readFileSync(postsPath,'utf8')); } catch { posts = []; }
-
-  // neduplikovat stejné mdUrl/sourceUrl
-  if (posts.some(p => (p.mdUrl && p.mdUrl===mdUrl) || (p.sourceUrl && p.sourceUrl===sourceUrl))) {
-    return { added:false, reason:'EXISTS' };
-  }
-
-  if (RESPECT_DAY_LIMIT){
-    const day = toDayKey(dateISO);
-    const countToday = posts.filter(p => toDayKey(p.date) === day).length;
-    if (countToday >= MAX_PER_DAY) {
-      return { added:false, reason:'DAY_LIMIT' };
-    }
-  }
-
-  const id = `${toDayKey(dateISO)}-${randId(6)}`;
-  const card = {
-    id,
-    title: title || 'Shrnutí',
-    date: new Date(dateISO).toISOString(),
-    sourceUrl,
-    sourceHost,
-    mdUrl,
-    summary: (summary || '').slice(0, 1200),
-  };
-
-  posts.unshift(card);
-  if (posts.length > 400) posts = posts.slice(0,400);
-
-  fs.writeFileSync(postsPath, JSON.stringify(posts, null, 2), 'utf8');
-  return { added:true, id };
-}
-
-// -------------------------------------------------------------
-// Hlavní běh
-// -------------------------------------------------------------
-async function run(){
-  console.log(`Reading range: '${SHEET_NAME}'!A,D,H..N`);
-  const rows = await getSheetRows();
-
-  ensureDocsScaffold();
-
+function domainOf(url) {
   try {
-    for (const row of rows){
-      const { rowNumber, createdAtRaw, url, status, mdUrl, publishFlag, csSummary, publishedAt } = row;
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch { return ''; }
+}
 
-      if (!url || !/^https?:\/\//i.test(url)){
-        if (url) await setRow(false, rowNumber, { status:'SKIP_BAD_URL', mdUrl:'', note:'Neplatná URL' });
-        continue;
-      }
+function normalizeBool(v) {
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'string') return /^true$/i.test(v.trim());
+  return false;
+}
 
-      const host = hostOf(url);
-      if (DOMAIN_BLOCKLIST.has(host)){
-        await setRow(false, rowNumber, { status:'SKIP_BLOCKED_DOMAIN', mdUrl:'', note:host });
-        continue;
-      }
+function looksEnglish(s = '') {
+  if (!s) return false;
+  const hasCz = /[áéěíóúůýžščřďťňÁÉĚÍÓÚŮÝŽŠČŘĎŤŇ]/.test(s);
+  const hasLat = /[A-Za-z]/.test(s);
+  return hasLat && !hasCz;
+}
 
-      // --- 1) zajisti kvalitní CS shrnutí v L ---
-      let finalSummary = csSummary ? stripHtml(csSummary) : '';
-      const summaryBad = !finalSummary || looksHtml(csSummary)
-        || !isCzech(finalSummary) || finalSummary.length < 120;
+function cleanupText(html) {
+  const $ = cheerio.load(html);
+  // odstraníme skripty, styly
+  $('script, style, noscript').remove();
+  // posbíráme odstavce
+  const paras = $('p').map((_, el) => $(el).text().trim()).get();
+  const text = paras.filter(Boolean).join('\n\n');
+  return text;
+}
 
-      if (summaryBad) {
-        try {
-          console.log(`Generuji/opravuji shrnutí (CS): ${url}`);
-          const { title: _t, text } = await getArticleData(url);
-          if (!text || text.length < MIN_CHARS) {
-            await setRow(false, rowNumber, { status:'SKIP_SHORT', mdUrl:'', note:`${text?.length||0} chars` });
-            continue;
-          }
-          let summary = '';
-          try {
-            summary = await getSummaryPerplexity(text);
-            if (!isCzech(summary)) {
-              summary = await translateToCzechWithPerplexity(summary || text.slice(0,1500));
-            }
-          } catch {
-            const sentences = text.split(/(?<=\.)\s+/).slice(0,3).join(' ');
-            summary = sentences || text.slice(0,600);
-            if (!isCzech(summary)) {
-              try { summary = await translateToCzechWithPerplexity(summary); } catch {}
-            }
-          }
-          finalSummary = stripHtml(summary);
-          await setRow(true, rowNumber, {
-            status: 'REVIEW',
-            mdUrl: '',
-            note: '',
-            publishAt: '',
-            cardId: '',
-            csSummary: finalSummary
-          });
-        } catch(e) {
-          await setRow(false, rowNumber, { status:'ERROR', mdUrl:'', note:e?.message || String(e) });
-          continue;
-        }
-      }
+async function fetchArticle(url) {
+  const UA = 'Mozilla/5.0 (compatible; MounjaroSummariesBot/1.0; +https://github.com/OnLi1971/mounjaro-summaries)';
+  const res = await axios.get(url, { headers: { 'User-Agent': UA }, timeout: 20000 });
+  const html = res.data || '';
+  const $ = cheerio.load(html);
+  const title = ($('meta[property="og:title"]').attr('content')
+    || $('title').first().text()
+    || '').trim();
+  const text = cleanupText(html);
+  return { title: title || url, text };
+}
 
-      // --- 2) publikace, když chceš (K=TRUE) a ještě není zveřejněno ---
-      if (publishFlag && !publishedAt) {
-        try {
-          console.log(`Publikace na web: ${url}`);
-          let title = '';
-          try { title = (await getArticleData(url)).title || ''; } catch {}
-          const mdLink = await saveToGitHub({
-            title: title || 'Shrnutí článku',
-            url,
-            summary: finalSummary
-          });
-          const createdAt = parseSheetDate(createdAtRaw) || new Date();
-          const upd = updateDocsSite({
-            title: title || 'Shrnutí',
-            dateISO: createdAt.toISOString(),
-            sourceUrl: url,
-            sourceHost: host,
-            mdUrl: mdLink,
-            summary: finalSummary,
-          });
-          if (!upd.added){
-            await setRow(false, rowNumber, {
-              status: 'ERROR',
-              mdUrl: mdLink,
-              note: upd.reason || 'unknown'
-            });
-            continue;
-          }
-          await setRow(true, rowNumber, {
-            status    : 'PUBLISHED',
-            mdUrl     : mdLink,
-            note      : '',
-            publishAt : new Date().toISOString(),
-            cardId    : upd.id,
-            csSummary : finalSummary
-          });
-        } catch(e){
-          await setRow(false, rowNumber, { status:'ERROR', mdUrl:'', note:e?.message || String(e) });
-        }
-      } else {
-        // necháme v REVIEW a čekáme na klik
-        if (!status || status === 'REVIEW'){
-          await setRow(false, rowNumber, { status:'REVIEW', mdUrl: mdUrl || '', note: 'čeká na publikaci' });
-        }
-      }
-    }
-  } finally {
-    // vždy vyprázdni frontu zápisů (i když se něco pokazí)
-    await flushSheetUpdates();
+async function summarizeCzech(text) {
+  if (!PPLX_KEY) return null;
+  const prompt = `Shrň následující text česky do 5–7 stručných bodů (bez úvodu a závěru, bez emotikonů). Zachovej fakta.
+
+${text.slice(0, 6000)}`;
+  try {
+    const resp = await axios.post(
+      'https://api.perplexity.ai/v1/chat/completions',
+      {
+        model: 'pplx-7b-chat',
+        messages: [
+          { role: 'system', content: 'Jsi asistent, který stručně shrnuje články v češtině.' },
+          { role: 'user', content: prompt }
+        ],
+        max_tokens: 700,
+        temperature: 0.3
+      },
+      { headers: { Authorization: `Bearer ${PPLX_KEY}`, 'Content-Type': 'application/json' } }
+    );
+    return resp.data?.choices?.[0]?.message?.content?.trim() || null;
+  } catch (e) {
+    console.warn('Perplexity summarize error:', e?.response?.status || e.message);
+    return null;
   }
 }
 
-// run
-run().catch(err => { console.error('FATAL:', err); process.exit(1); });
+async function translateToCzech(text) {
+  if (!PPLX_KEY) return text;
+  try {
+    const resp = await axios.post(
+      'https://api.perplexity.ai/v1/chat/completions',
+      {
+        model: 'pplx-7b-chat',
+        messages: [
+          { role: 'system', content: 'Jsi pečlivý překladatel EN->CS. Vrať jen přeložený text bez komentářů.' },
+          { role: 'user', content: `Přelož do češtiny:\n\n${text}` }
+        ],
+        max_tokens: 800,
+        temperature: 0.2
+      },
+      { headers: { Authorization: `Bearer ${PPLX_KEY}`, 'Content-Type': 'application/json' } }
+    );
+    return resp.data?.choices?.[0]?.message?.content?.trim() || text;
+  } catch {
+    return text;
+  }
+}
+
+async function ensureCzechSummary(articleText, sheetSummaryCz) {
+  // 1) ruční shrnutí z L v tabulce má prioritu (když je česky)
+  if (sheetSummaryCz && !looksEnglish(sheetSummaryCz)) {
+    return sheetSummaryCz.trim();
+  }
+
+  // 2) zkus rovnou česky shrnout
+  let s = await summarizeCzech(articleText);
+
+  // 3) pokud výstup působí EN, rychle přeložit
+  if (s && looksEnglish(s)) {
+    s = await translateToCzech(s);
+  }
+
+  // 4) nouzový výcuc – první delší odstavec nebo první znaky
+  if (!s || s.length < 40) {
+    const para = (articleText || '')
+      .split(/\n\s*\n/).map(t => t.trim()).find(t => t.length > 80)
+      || (articleText || '').slice(0, 500);
+    s = para ? `${para.slice(0, 700)}${para.length > 700 ? '…' : ''}` : 'Shrnutí není dostupné.';
+  }
+
+  return s;
+}
+
+function readPostsJson() {
+  try {
+    if (!fs.existsSync(DOCS_DIR)) fs.mkdirSync(DOCS_DIR, { recursive: true });
+    if (!fs.existsSync(POSTS_JSON)) return [];
+    const raw = fs.readFileSync(POSTS_JSON, 'utf8');
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePostsJson(posts) {
+  const pretty = JSON.stringify(posts, null, 2);
+  fs.writeFileSync(POSTS_JSON, pretty, 'utf8');
+}
+
+function upsertPost(posts, entry) {
+  // De-dupe podle URL
+  const idx = posts.findIndex(p => (p.url || '').trim() === entry.url.trim());
+  if (idx >= 0) {
+    posts[idx] = { ...posts[idx], ...entry };
+  } else {
+    posts.push(entry);
+  }
+}
+
+// ==== GITHUB (MD) ============================================================
+
+async function saveMarkdownToGitHub(title, url, summaryCz) {
+  const octo = octokit();
+  const today = new Date().toISOString().slice(0, 10);
+  const fileName = `${today}-${randId(6)}.md`;
+  const mdPath = `${SUMMARIES_DIR}/${fileName}`;
+
+  const content = Buffer.from(
+    `# Shrnutí (CZ)\n\n**Zdroj:** [${title}](${url})\n\n${summaryCz}\n`,
+    'utf8'
+  ).toString('base64');
+
+  await octo.repos.createOrUpdateFileContents({
+    owner: GH_OWNER,
+    repo: GH_REPO,
+    path: mdPath,
+    message: `Add summary: ${title || url}`,
+    content,
+    branch: GH_BRANCH
+  });
+
+  return `https://github.com/${GH_OWNER}/${GH_REPO}/blob/${GH_BRANCH}/${mdPath}`;
+}
+
+// ==== SHEETS I/O =============================================================
+
+async function getSheetValues() {
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: 'v4', auth: client });
+  console.log(`Reading range: ${READ_RANGE}`);
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: READ_RANGE
+  });
+  const rows = res.data.values || [];
+  return { sheets, rows };
+}
+
+async function batchUpdate(sheets, updates) {
+  if (updates.length === 0) return;
+  // posílejme po menších dávkách, abychom nevyčerpali per-minute limit
+  const CHUNK = 25;
+  for (let i = 0; i < updates.length; i += CHUNK) {
+    const chunk = updates.slice(i, i + CHUNK);
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: {
+        valueInputOption: 'RAW',
+        data: chunk
+      }
+    });
+    // drobné zpoždění
+    await sleep(300);
+  }
+}
+
+// ==== MAIN ===================================================================
+
+async function run() {
+  console.log('== Mounjaro manual publish (K=TRUE & J empty) v3.2 ==');
+
+  const { sheets, rows } = await getSheetValues();
+  if (rows.length <= 1) {
+    console.log('No data rows.');
+    return;
+  }
+
+  const header = rows[0];
+  const updates = []; // batch for H/I/J/L
+  const posts = readPostsJson();
+
+  let processed = 0;
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const rowNum = i + 1; // 1-based index in Sheets
+
+    const title = (r[COL.TITLE] || '').toString().trim();
+    const url = (r[COL.URL] || '').toString().trim();
+    const publish = normalizeBool(r[COL.PUBLISH]);
+    const publishedAt = (r[COL.PUBLISHED_AT] || '').toString().trim();
+    let czSummarySheet = (r[COL.CZ_SUMMARY] || '').toString();
+
+    if (!url) continue;
+
+    // publikujeme jen ručně povolené a dosud nepublikované
+    if (!publish || publishedAt) continue;
+
+    // blokované domény ven
+    const d = domainOf(url);
+    if (BLOCKED_DOMAINS.has(d)) {
+      console.log(`SKIP_BLOCKED_DOMAIN ${d} @ row ${rowNum}`);
+      // zapiš stav
+      updates.push({
+        range: `'${SHEET_NAME}'!H${rowNum}:H${rowNum}`,
+        values: [['SKIP_BLOCKED_DOMAIN']]
+      });
+      continue;
+    }
+
+    try {
+      console.log(`Processing row ${rowNum}: ${url}`);
+      // načíst článek
+      const { title: fetchedTitle, text } = await fetchArticle(url);
+      const finalTitle = title || fetchedTitle || url;
+
+      // zajistit české shrnutí (L)
+      const summaryCz = await ensureCzechSummary(text, czSummarySheet);
+      const usedFallback = !PPLX_KEY || looksEnglish(czSummarySheet);
+
+      // uložit MD do GitHubu
+      const mdUrl = await saveMarkdownToGitHub(finalTitle, url, summaryCz);
+
+      // přidat do webu (posts.json)
+      upsertPost(posts, {
+        title: finalTitle,
+        url,
+        date: nowIso(),
+        source: d,
+        summary: summaryCz
+      });
+
+      // připravit update do Sheets – H/I/J + L (pokud L bylo prázdné nebo EN, přepiš česky)
+      const status = usedFallback ? 'OK_FALLBACK' : 'OK';
+      const setL = (!czSummarySheet || looksEnglish(czSummarySheet)) ? summaryCz : czSummarySheet;
+
+      updates.push({
+        range: `'${SHEET_NAME}'!H${rowNum}:J${rowNum}`,
+        values: [[status, mdUrl, nowIso()]]
+      });
+      updates.push({
+        range: `'${SHEET_NAME}'!L${rowNum}:L${rowNum}`,
+        values: [[setL]]
+      });
+
+      processed += 1;
+      // malý delay mezi doménami (opatrnost vůči rate-limitům webů)
+      await sleep(200);
+
+    } catch (e) {
+      console.error(`ERROR row ${rowNum}:`, e.message);
+      updates.push({
+        range: `'${SHEET_NAME}'!H${rowNum}:H${rowNum}`,
+        values: [[`ERROR`]]
+      });
+      // pokračuj dál
+    }
+  }
+
+  // zapiš posts.json
+  if (processed > 0) {
+    // volitelně: seřaď podle data desc
+    posts.sort((a, b) => (new Date(b.date)) - (new Date(a.date)));
+    writePostsJson(posts);
+  }
+
+  // proveď batch update do Sheets
+  if (updates.length > 0) {
+    await batchUpdate(sheets, updates);
+  }
+
+  console.log(`Done. Published rows: ${processed}`);
+}
+
+run().catch(err => {
+  console.error('FATAL:', err);
+  process.exit(1);
+});
