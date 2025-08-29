@@ -36,10 +36,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'   # funguje, když v repu je package-lock.json
+          cache: 'npm'   # ok, když v repo existuje nějaký package-lock.json
 
       - name: Install dependencies
-        run: npm ci || npm install
+        run: npm install
 
       - name: Run manual publisher (Sheets → MD + docs/)
         env:
