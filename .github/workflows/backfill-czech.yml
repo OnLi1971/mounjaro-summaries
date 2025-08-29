@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
 
-# nepouštěj paralelně
+# nepouštěj víc běhů najednou
 concurrency:
   group: sheet-publish
   cancel-in-progress: true
@@ -36,24 +36,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'  # funguje, když je v repu package-lock.json
+          cache: 'npm'   # funguje, když v repu je package-lock.json
 
       - name: Install dependencies
         run: npm ci || npm install
-
-      # (volitelné) pokud by lockfile vznikl nově, commitni ho pro stabilní buildy
-      - name: Commit package-lock.json if newly generated
-        shell: bash
-        run: |
-          if ! git ls-files --error-unmatch package-lock.json >/dev/null 2>&1; then
-            if [ -f package-lock.json ]; then
-              git config user.name  "github-actions[bot]"
-              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git add package-lock.json
-              git commit -m "Add generated package-lock.json [skip ci]" || true
-              git push || true
-            fi
-          fi
 
       - name: Run manual publisher (Sheets → MD + docs/)
         env:
@@ -61,41 +47,32 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node perplexity-sheet-to-github.js
 
-- name: Commit docs/ if changed
-  shell: bash
-  run: |
-    set -euo pipefail
+      # Commit jen změny v docs/ a bezpečně pushni, i když se mezitím posunul remote
+      - name: Commit docs/ if changed (safe rebase with autostash)
+        shell: bash
+        run: |
+          set -euo pipefail
 
-    git config --global user.name  "github-actions[bot]"
-    git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-    git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-    # 1) Bezpečně odlož všechny místní změny (vč. untracked)
-    git stash push -u -m "ci-autostash" || true
+          # 1) Odlož všechny lokální změny (včetně untracked), aby rebase nepadal
+          git stash push -u -m "ci-autostash" || true
 
-    # 2) Srovnej se vzdáleným main (rebase)
-    git fetch origin main
-    git rebase origin/main || true
+          # 2) Zarovnej se na vzdálený main
+          git fetch origin main
+          git rebase origin/main || true
 
-    # 3) Vrať stash zpět (může přinést zpět třeba google-service-account.json apod.)
-    git stash pop || true
+          # 3) Vrať stash zpět
+          git stash pop || true
 
-    # 4) Přidej jen to, co nás zajímá (docs/)
-    if [ -n "$(git status --porcelain docs)" ]; then
-      git add docs
-      git commit -m "Update website (docs) [skip ci]" || true
-
-      # 5) Proti závodu s dalším pushem: force-with-lease je bezpečný kompromis
-      git push --force-with-lease origin HEAD:main
-    else
-      echo "No changes in docs/"
-    fi
-
+          # 4) Commituj jen obsah webu
           if [ -n "$(git status --porcelain docs)" ]; then
             git add docs
-            git commit -m "Update website (docs) [skip ci]"
-            git pull --rebase origin main || true
-            git push origin HEAD:main
+            git commit -m "Update website (docs) [skip ci]" || true
+            # 5) Bezpečný push proti závodu
+            git push --force-with-lease origin HEAD:main
           else
             echo "No changes in docs/"
           fi
