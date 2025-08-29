@@ -1,12 +1,11 @@
 // perplexity-sheet-to-github.js
 // -------------------------------------------------------------
 // Režim "schvaluju ručně":
-// - Skript nejdřív připraví náhled (CS_SUMMARY do sloupce L) a nastaví H=REVIEW.
-// - Na web zveřejní jen řádky s K (PUBLISH?) = TRUE a M je prázdné.
-// - Po zveřejnění vyplní H=PUBLISHED, I=MD URL, M=timestamp, N=CARD_ID, J=pozn.
-// - Vynucuje češtinu (případně přeloží přes Perplexity).
-// - Blokuje nevhodné domény, kontroluje minimální délku textu.
-// - Denní limit v manuálním režimu defaultně nevynucuje (RESPECT_DAY_LIMIT=false).
+// - Pro každý řádek stáhne článek, vygeneruje české shrnutí do L (CS_SUMMARY)
+//   a do H zapíše REVIEW (čeká na schválení).
+// - Na web a do summaries/ publikuje POUZE řádky s K (PUBLISH?) = TRUE a prázdným M (PUBLISHED_AT).
+// - Po publikaci: H=PUBLISHED, I=MD URL, M=timestamp, N=CARD_ID, J=NOTE.
+// - Zápisy do Sheets jsou frontované a posílají se v dávkách (batchUpdate) s retry/backoff.
 // -------------------------------------------------------------
 
 require('dotenv').config({ path: './summaries.env' });
@@ -29,7 +28,7 @@ const summariesDir = 'summaries';
 
 // ---- Google Sheets ----
 const SPREADSHEET_ID = '1KgrYXHpVfTAGQZT6f15aARGCQ-qgNQZM4HWQCiqt14s';
-const SHEET_NAME     = 'List 1'; // POZOR: mezera v názvu
+const SHEET_NAME     = 'List 1'; // přesně takhle (s mezerou)
 
 // Sloupce:
 // A = Datum
@@ -37,10 +36,10 @@ const SHEET_NAME     = 'List 1'; // POZOR: mezera v názvu
 // H = Status (REVIEW | PUBLISHED | ERROR | SKIP_...)
 // I = MD URL
 // J = NOTE
-// K = PUBLISH? (TRUE/FALSE)
+// K = PUBLISH? (TRUE/FALSE)  ← klikáš ručně
 // L = CS_SUMMARY (náhled shrnutí v češtině)
-// M = PUBLISHED_AT (ISO timestamp)
-// N = CARD_ID (id karty na webu)
+// M = PUBLISHED_AT (ISO timestamp)  ← vyplní skript
+// N = CARD_ID (id karty na webu)    ← vyplní skript
 
 const auth = new google.auth.GoogleAuth({
   keyFile: 'google-service-account.json',
@@ -49,9 +48,10 @@ const auth = new google.auth.GoogleAuth({
 
 // ---- Heuristiky & limity ----
 const MIN_CHARS   = 900;
-const RESPECT_DAY_LIMIT = false; // ruční režim: nechat false
+const RESPECT_DAY_LIMIT = false; // manuální režim: necháváme vypnuté
 const MAX_PER_DAY = 3;
 
+// Blokované domény (nepublikovat)
 const DOMAIN_BLOCKLIST = new Set([
   'gwa-prod-pxm-api.s3.amazonaws.com',
   'community.whattoexpect.com',
@@ -91,19 +91,76 @@ function parseSheetDate(s){
   return isNaN(d) ? null : d;
 }
 
-// jazyk: jednoduchá detekce češtiny (alespoň 1 diakritika)
+// detekce češtiny (stačí 1 diakritické písmeno)
 function isCzech(s = '') {
   return /[áéěíóúůýžščřďťňÁÉĚÍÓÚŮÝŽŠČŘĎŤŇ]/.test(s);
 }
 
 // -------------------------------------------------------------
-// Sheets I/O
+// Sheets write queue (batchUpdate + backoff) — proti HTTP 429
+// -------------------------------------------------------------
+const SHEET_BATCH_SIZE = 50;
+const SHEET_MAX_RETRIES = 6;
+const SHEET_QUEUE = [];
+
+async function sheetsClient(){
+  const client = await auth.getClient();
+  return google.sheets({ version:'v4', auth: client });
+}
+
+// frontuj jeden řádek do konkrétního range
+async function queueSheetUpdate(range, valuesArr) {
+  SHEET_QUEUE.push({ range, values: valuesArr });
+  if (SHEET_QUEUE.length >= SHEET_BATCH_SIZE) {
+    await flushSheetUpdates();
+  }
+}
+
+// pošli frontu v dávkách s retry/backoff
+async function flushSheetUpdates() {
+  if (SHEET_QUEUE.length === 0) return;
+  const svc = await sheetsClient();
+
+  while (SHEET_QUEUE.length) {
+    const chunk = SHEET_QUEUE.splice(0, SHEET_BATCH_SIZE);
+    const data = chunk.map(u => ({ range: u.range, values: [u.values] })); // 1 řádek per range
+
+    let attempt = 0;
+    for (;;) {
+      try {
+        await svc.spreadsheets.values.batchUpdate({
+          spreadsheetId: SPREADSHEET_ID,
+          valueInputOption: 'RAW',
+          requestBody: { data },
+        });
+        break; // OK
+      } catch (e) {
+        const status = e?.response?.status || e?.code;
+        if (status === 429 || status === 503) {
+          const retryAfter = parseInt(e?.response?.headers?.['retry-after'] || '0', 10);
+          const delay = retryAfter > 0 ? retryAfter * 1000 : Math.min(32000, 1000 * Math.pow(2, attempt));
+          attempt++;
+          if (attempt > SHEET_MAX_RETRIES) {
+            console.error('Sheets batchUpdate exceeded retries; failing chunk.', e.message || e);
+            throw e;
+          }
+          console.warn(`Sheets ${status} — retrying in ${Math.round(delay/1000)}s (attempt ${attempt})`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw e; // jiná chyba
+      }
+    }
+  }
+}
+
+// -------------------------------------------------------------
+// Sheets I/O — načtení řádků a zapisovací helper
 // -------------------------------------------------------------
 async function getSheetRows(){
-  const client = await auth.getClient();
-  const sheets = google.sheets({ version:'v4', auth: client });
+  const svc = await sheetsClient();
 
-  const res = await sheets.spreadsheets.values.batchGet({
+  const res = await svc.spreadsheets.values.batchGet({
     spreadsheetId: SPREADSHEET_ID,
     ranges: [
       `${SHEET_NAME}!A2:A`,  // datum
@@ -147,44 +204,17 @@ async function getSheetRows(){
   return out;
 }
 
+// zapisuje do H..J a/nebo L..N přes frontu
 async function setRow(rangeFromColHtoN, rowNumber, { status, mdUrl='', note='', publishAt='', cardId='', csSummary=null }){
-  // rangeFromColHtoN = true → zapisujeme H..N, jinak jen H..J
-  const client = await auth.getClient();
-  const sheets = google.sheets({ version:'v4', auth: client });
-
-  let values;
-  let range;
   if (rangeFromColHtoN){
-    // H I J K L M N – K (checkbox) necháme prázdné, protože si ho klikáš ručně
-    // Zapíšeme: H=status, I=mdUrl, J=note, K= (no change), L=csSummary?, M=publishAt, N=cardId
-    // Abychom K nepřepsali, použijeme dva write calls: H..J a L..N
-    // 1) H..J
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${SHEET_NAME}!H${rowNumber}:J${rowNumber}`,
-      valueInputOption: 'RAW',
-      requestBody: { values: [[status, mdUrl, note]] },
-    });
-    // 2) L..N
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${SHEET_NAME}!L${rowNumber}:N${rowNumber}`,
-      valueInputOption: 'RAW',
-      requestBody: { values: [[csSummary ?? '', publishAt, cardId]] },
-    });
-    return;
+    // H..J (status, mdUrl, note)
+    await queueSheetUpdate(`${SHEET_NAME}!H${rowNumber}:J${rowNumber}`, [status, mdUrl, note]);
+    // L..N (csSummary, publishedAt, cardId) — K (checkbox) nenecháváme měnit
+    await queueSheetUpdate(`${SHEET_NAME}!L${rowNumber}:N${rowNumber}`, [csSummary ?? '', publishAt, cardId]);
   } else {
-    // jen H..J (status, md, note)
-    values = [[status, mdUrl, note]];
-    range  = `${SHEET_NAME}!H${rowNumber}:J${rowNumber}`;
+    // jen H..J
+    await queueSheetUpdate(`${SHEET_NAME}!H${rowNumber}:J${rowNumber}`, [status, mdUrl, note]);
   }
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range,
-    valueInputOption: 'RAW',
-    requestBody: { values },
-  });
 }
 
 // -------------------------------------------------------------
@@ -312,12 +342,11 @@ function updateDocsSite({ title, dateISO, sourceUrl, sourceHost, mdUrl, summary 
   let posts = [];
   try { posts = JSON.parse(fs.readFileSync(postsPath,'utf8')); } catch { posts = []; }
 
-  // nepřidávej duplicitní stejný sourceUrl/mdUrl
+  // neduplikovat stejné mdUrl/sourceUrl
   if (posts.some(p => (p.mdUrl && p.mdUrl===mdUrl) || (p.sourceUrl && p.sourceUrl===sourceUrl))) {
     return { added:false, reason:'EXISTS' };
   }
 
-  // případný denní limit (v manuálním režimu defaultně vypnuto)
   if (RESPECT_DAY_LIMIT){
     const day = toDayKey(dateISO);
     const countToday = posts.filter(p => toDayKey(p.date) === day).length;
@@ -353,118 +382,123 @@ async function run(){
 
   ensureDocsScaffold();
 
-  for (const row of rows){
-    const { rowNumber, createdAtRaw, url, status, mdUrl, publishFlag, csSummary, publishedAt, cardId } = row;
+  try {
+    for (const row of rows){
+      const { rowNumber, createdAtRaw, url, status, mdUrl, publishFlag, csSummary, publishedAt, cardId } = row;
 
-    if (!url || !/^https?:\/\//i.test(url)){
-      if (url) await setRow(false, rowNumber, { status:'SKIP_BAD_URL', mdUrl:'', note:'Neplatná URL' });
-      continue;
-    }
+      if (!url || !/^https?:\/\//i.test(url)){
+        if (url) await setRow(false, rowNumber, { status:'SKIP_BAD_URL', mdUrl:'', note:'Neplatná URL' });
+        continue;
+      }
 
-    const host = hostOf(url);
-    if (DOMAIN_BLOCKLIST.has(host)){
-      // Pokud je bloklá doména, jen zapiš SKIP
-      await setRow(false, rowNumber, { status:'SKIP_BLOCKED_DOMAIN', mdUrl:'', note:host });
-      continue;
-    }
+      const host = hostOf(url);
+      if (DOMAIN_BLOCKLIST.has(host)){
+        await setRow(false, rowNumber, { status:'SKIP_BLOCKED_DOMAIN', mdUrl:'', note:host });
+        continue;
+      }
 
-    // 1) PŘÍPRAVA NÁHLEDU (shrnutí do L), pokud chybí
-    if (!csSummary){
-      try{
-        console.log(`Náhled shrnutí: ${url}`);
-        const { title, text } = await getArticleData(url);
-        if (!text || text.length < MIN_CHARS){
-          await setRow(false, rowNumber, { status:'SKIP_SHORT', mdUrl:'', note:`${text?.length||0} chars` });
-          continue;
-        }
-
-        // shrnutí + vynucení češtiny
-        let summary = '';
+      // 1) PŘÍPRAVA NÁHLEDU (CS_SUMMARY do L), pokud chybí
+      if (!csSummary){
         try{
-          summary = await getSummaryPerplexity(text);
-          if (!isCzech(summary)){
-            summary = await translateToCzechWithPerplexity(summary || text.slice(0,1500));
+          console.log(`Náhled shrnutí: ${url}`);
+          const { title, text } = await getArticleData(url);
+          if (!text || text.length < MIN_CHARS){
+            await setRow(false, rowNumber, { status:'SKIP_SHORT', mdUrl:'', note:`${text?.length||0} chars` });
+            continue;
           }
-        }catch(e){
-          // fallback + překlad
-          const sentences = text.split(/(?<=\.)\s+/).slice(0,3).join(' ');
-          summary = sentences || text.slice(0,600);
-          if (!isCzech(summary)){
-            try { summary = await translateToCzechWithPerplexity(summary); } catch {}
+
+          // shrnutí + vynucení češtiny
+          let summary = '';
+          try{
+            summary = await getSummaryPerplexity(text);
+            if (!isCzech(summary)){
+              summary = await translateToCzechWithPerplexity(summary || text.slice(0,1500));
+            }
+          }catch(e){
+            // fallback + překlad
+            const sentences = text.split(/(?<=\.)\s+/).slice(0,3).join(' ');
+            summary = sentences || text.slice(0,600);
+            if (!isCzech(summary)){
+              try { summary = await translateToCzechWithPerplexity(summary); } catch {}
+            }
           }
-        }
 
-        // Zapiš shrnutí do L + status REVIEW (připraveno ke schválení)
-        await setRow(true, rowNumber, {
-          status: 'REVIEW',
-          mdUrl: '',
-          note: '',
-          publishAt: '',
-          cardId: '',
-          csSummary: summary
-        });
-        // nepokračuj na publikaci v tomto průchodu – čekáme na klik v K
-        continue;
-      }catch(e){
-        await setRow(false, rowNumber, { status:'ERROR', mdUrl:'', note:e?.message || String(e) });
-        continue;
-      }
-    }
-
-    // 2) PUBLIKACE – pouze pokud je K=TRUE a zatím nebylo publikováno (M prázdné)
-    if (publishFlag && !publishedAt){
-      try{
-        console.log(`Publikace na web: ${url}`);
-        // Stáhni titulek (když ho nemáme) – text už máme shrnutý v L
-        let title = '';
-        try { title = (await getArticleData(url)).title || ''; } catch { title = ''; }
-
-        // Ulož MD do GitHubu
-        const mdLink = await saveToGitHub({
-          title: title || 'Shrnutí článku',
-          url,
-          summary: csSummary
-        });
-
-        // Přidej kartu na web
-        const createdAt = parseSheetDate(createdAtRaw) || new Date();
-        const upd = updateDocsSite({
-          title: title || 'Shrnutí',
-          dateISO: createdAt.toISOString(),
-          sourceUrl: url,
-          sourceHost: host,
-          mdUrl: mdLink,
-          summary: csSummary,
-        });
-
-        if (!upd.added){
-          await setRow(false, rowNumber, {
-            status: 'ERROR',
-            mdUrl: mdLink,
-            note: upd.reason || 'unknown'
+          // Zapiš shrnutí do L + status REVIEW (čeká na tvé schválení)
+          await setRow(true, rowNumber, {
+            status: 'REVIEW',
+            mdUrl: '',
+            note: '',
+            publishAt: '',
+            cardId: '',
+            csSummary: summary
           });
+
+          // nepokračuj k publikaci v tomto průchodu – počkáme na K=TRUE
+          continue;
+        }catch(e){
+          await setRow(false, rowNumber, { status:'ERROR', mdUrl:'', note:e?.message || String(e) });
           continue;
         }
-
-        // Zapiš PUBLISHED + metadata
-        await setRow(true, rowNumber, {
-          status    : 'PUBLISHED',
-          mdUrl     : mdLink,
-          note      : '',
-          publishAt : new Date().toISOString(),
-          cardId    : upd.id,
-          csSummary : csSummary // ponecháme pro tebe k náhledu
-        });
-
-      }catch(e){
-        await setRow(false, rowNumber, { status:'ERROR', mdUrl:'', note:e?.message || String(e) });
       }
-    } else {
-      // nic – shrnutí je připravené a čekáme na K=TRUE
-      if (!status || status === 'REVIEW'){
-        await setRow(false, rowNumber, { status:'REVIEW', mdUrl: mdUrl || '', note: 'čeká na publikaci' });
+
+      // 2) PUBLIKACE — pouze když K=TRUE a dosud nebylo publikováno (M prázdné)
+      if (publishFlag && !publishedAt){
+        try{
+          console.log(`Publikace na web: ${url}`);
+          // Stáhnout titulek (když nemáme); text už nepotřebujeme
+          let title = '';
+          try { title = (await getArticleData(url)).title || ''; } catch { title = ''; }
+
+          // Ulož MD do GitHubu
+          const mdLink = await saveToGitHub({
+            title: title || 'Shrnutí článku',
+            url,
+            summary: csSummary
+          });
+
+          // Přidej kartu na web
+          const createdAt = parseSheetDate(createdAtRaw) || new Date();
+          const upd = updateDocsSite({
+            title: title || 'Shrnutí',
+            dateISO: createdAt.toISOString(),
+            sourceUrl: url,
+            sourceHost: host,
+            mdUrl: mdLink,
+            summary: csSummary,
+          });
+
+          if (!upd.added){
+            await setRow(false, rowNumber, {
+              status: 'ERROR',
+              mdUrl: mdLink,
+              note: upd.reason || 'unknown'
+            });
+            continue;
+          }
+
+          // Zapiš PUBLISHED + metadata
+          await setRow(true, rowNumber, {
+            status    : 'PUBLISHED',
+            mdUrl     : mdLink,
+            note      : '',
+            publishAt : new Date().toISOString(),
+            cardId    : upd.id,
+            csSummary : csSummary
+          });
+
+        }catch(e){
+          await setRow(false, rowNumber, { status:'ERROR', mdUrl:'', note:e?.message || String(e) });
+        }
+      } else {
+        // shrnutí je připravené a čekáme na K=TRUE
+        if (!status || status === 'REVIEW'){
+          await setRow(false, rowNumber, { status:'REVIEW', mdUrl: mdUrl || '', note: 'čeká na publikaci' });
+        }
       }
     }
+  } finally {
+    // vždy vyprázdni frontu zápisů (i když se něco pokazí)
+    await flushSheetUpdates();
   }
 }
 
