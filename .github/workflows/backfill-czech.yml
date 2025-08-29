@@ -1,67 +1,52 @@
-name: Backfill Czech summaries
+name: Manual publish (Sheets → GitHub)
 
 on:
   workflow_dispatch:
 
-# Zabraň paralením běhům, co by se přetahovaly o push
-concurrency:
-  group: backfill-czech-${{ github.ref }}
-  cancel-in-progress: false
-
 permissions:
   contents: write
 
+concurrency:
+  group: sheet-publish
+  cancel-in-progress: true
+
 jobs:
-  backfill:
+  publish:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # ať máme historii pro rebase
+
+      - name: Create google-service-account.json
+        run: printf '%s' "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}" > google-service-account.json
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
-      - name: Install axios
-        shell: bash
-        run: npm install --no-audit --no-fund axios
+      - name: Install deps
+        run: npm ci || npm install
 
-      - name: Run backfill script
-        shell: bash
+      - name: Run manual gate script
         env:
           PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-        run: node scripts/backfill-czech.js
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node perplexity-sheet-to-github.js
 
-      - name: Commit & push changes
-        shell: bash
+      - name: Commit docs/ if changed
         run: |
           set -euo pipefail
-
           git config --global user.name  "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-          # Stáhni poslední main a rebase s autostash (zabrání "unstaged changes")
-          git fetch origin main
-          git -c rebase.autoStash=true pull --rebase origin main || true
-
-          # Přidej jen to, co nás zajímá
-          git add docs/posts.json
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
+          if [ -n "$(git status --porcelain docs)" ]; then
+            git add docs
+            git commit -m "Update website (docs) [skip ci]"
+            git pull --rebase origin main || true
+            git push origin HEAD:main
+          else
+            echo "No changes in docs/"
           fi
-
-          git commit -m "Backfill CZ summaries [skip ci]"
-
-          # Ještě jednou rebáznout pro jistotu, kdyby mezitím něco přibylo
-          git fetch origin main
-          git -c rebase.autoStash=true pull --rebase origin main || true
-
-          # Bezpečný push
-          git push --force-with-lease origin HEAD:main
