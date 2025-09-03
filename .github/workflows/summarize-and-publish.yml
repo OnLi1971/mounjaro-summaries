@@ -1,1 +1,85 @@
+name: Summarize & Publish (Sheets ➜ docs/posts.json)
 
+on:
+  # Ruční spuštění z Actions
+  workflow_dispatch:
+  # Denně v 06:05 CET/CEST (GitHub běží v UTC → 04:05 UTC ~ 06:05 v Praze v létě)
+  schedule:
+    - cron: "5 4 * * *"
+
+# Zabraň souběžným běhům tohoto workflow
+concurrency:
+  group: summarize-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo (with history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create google-service-account.json from secret
+        run: |
+          if [ -z "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}" ]; then
+            echo "Missing secret GOOGLE_SERVICE_ACCOUNT_JSON"; exit 1
+          fi
+          printf '%s' "${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}" > google-service-account.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run summarize & publish script
+        env:
+          # povinné
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+          # volitelné (když nevyplníš, skript použije defaulty)
+          SHEETS_ID: 1KgrYXHpVfTAGQZT6f15aARGCQ-qgNQZM4HWQCiqt14s
+          SHEETS_TAB: "List 1"
+        run: |
+          if [ ! -f scripts/summarize-and-publish.js ]; then
+            echo "Missing scripts/summarize-and-publish.js"; exit 1
+          fi
+          node scripts/summarize-and-publish.js
+
+      - name: Commit docs/posts.json (if changed)
+        run: |
+          set -euo pipefail
+
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+          # Přidej jen webový výstup
+          git add docs/posts.json
+
+          # Když nic nezměněno, skonči čistě
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          # Rebase s autostash, ať nepadne na non-fast-forward
+          git fetch origin main
+          git -c rebase.autoStash=true pull --rebase origin main || true
+
+          git commit -m "Update posts.json [skip ci]"
+
+          # Pro jistotu ještě jednou rebase (kdyby mezitím něco přibylo)
+          git fetch origin main
+          git -c rebase.autoStash=true pull --rebase origin main || true
+
+          # Bezpečný push
+          git push --force-with-lease origin HEAD:main
